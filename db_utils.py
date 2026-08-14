@@ -3,7 +3,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 
 # OBTENER URL DE LOS SECRETOS SEGUROS
-DATABASE_URL = st.secrets["DATABASE_URL"]
+DATABASE_URL = os.getenv("DATABASE_URL") or st.secrets.get("DATABASE_URL")
 
 # 1. OPTIMIZACIÓN: Caching de recursos con verificación de estado activa
 @st.cache_resource
