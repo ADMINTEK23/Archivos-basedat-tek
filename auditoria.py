@@ -31,7 +31,6 @@ def obtener_metricas_auditoria_usuarios(fecha_inicio: date, fecha_fin: date) -> 
         if df is None or df.empty:
             return pd.DataFrame(columns=['MODULO', 'USUARIO', 'FECHA_CAPTURA', 'TOTAL'])
             
-        # 💡 MEJORA 1: Limpieza optimizada. Confiamos en el "modulo" del SQL y usamos float64 para máxima precisión.
         df.rename(columns={'modulo': 'MODULO'}, inplace=True)
         df.columns = df.columns.str.upper()
         df['FECHA_CAPTURA'] = pd.to_datetime(df['FECHA_CAPTURA'], errors='coerce')
@@ -91,14 +90,15 @@ def mostrar_pestana_auditoria_usuarios():
         return
         
     df_filtrado = df_filtrado.sort_values(['USUARIO', 'FECHA_CAPTURA'])
-    df_filtrado['DIFERENCIA_MINUTOS'] = df_filtrado.groupby('USUARIO', observed=False)['FECHA_CAPTURA'].diff().dt.total_seconds() / 60.0
+    
+    # 💡 CÁLCULO DE DIFERENCIAS EN SEGUNDOS Y MINUTOS
+    df_filtrado['DIFERENCIA_SEGUNDOS'] = df_filtrado.groupby('USUARIO', observed=False)['FECHA_CAPTURA'].diff().dt.total_seconds()
+    df_filtrado['DIFERENCIA_MINUTOS'] = df_filtrado['DIFERENCIA_SEGUNDOS'] / 60.0
     
     # Cálculos generales
     capturas_continuas = df_filtrado[df_filtrado['DIFERENCIA_MINUTOS'] <= 30]
     tiempo_promedio = capturas_continuas['DIFERENCIA_MINUTOS'].mean()
     df_filtrado['FECHA_DIA'] = df_filtrado['FECHA_CAPTURA'].dt.date
-    
-    # 💡 MEJORA 2: Columna auxiliar para el gráfico de dispersión (convertir HH:MM a decimal)
     df_filtrado['HORA_EXACTA'] = df_filtrado['FECHA_CAPTURA'].dt.hour + (df_filtrado['FECHA_CAPTURA'].dt.minute / 60.0)
     
     jornadas = df_filtrado.groupby(['USUARIO', 'FECHA_DIA'], observed=False)['FECHA_CAPTURA'].agg(['min', 'max'])
@@ -108,16 +108,19 @@ def mostrar_pestana_auditoria_usuarios():
     st.title("📊 Cuadro de Mando: Auditoría de Usuarios")
     st.caption(f"Rango: **{f_inicio}** al **{f_fin}** | Filtro: **{usuario_sel}**")
     
-    # 💡 MEJORA 3: Detección de Banderas Rojas (Anomalías)
+    # 💡 BANDERAS ROJAS ACTUALIZADAS (Menos de 20 segundos y más de 4 minutos)
     capturas_madrugada = df_filtrado[df_filtrado['FECHA_CAPTURA'].dt.hour < 6]
-    capturas_veloces = df_filtrado[df_filtrado['DIFERENCIA_MINUTOS'] < 1.0] # Menos de 1 minuto entre capturas
+    capturas_muy_rapidas = df_filtrado[(df_filtrado['DIFERENCIA_SEGUNDOS'] >= 0) & (df_filtrado['DIFERENCIA_SEGUNDOS'] < 20)]
+    capturas_pausadas = df_filtrado[df_filtrado['DIFERENCIA_MINUTOS'] > 4.0]
     
-    if not capturas_madrugada.empty or not capturas_veloces.empty:
+    if not capturas_madrugada.empty or not capturas_muy_rapidas.empty or not capturas_pausadas.empty:
         alertas = []
         if not capturas_madrugada.empty:
             alertas.append(f"**{len(capturas_madrugada)}** registros capturados de madrugada (antes de las 6:00 AM).")
-        if not capturas_veloces.empty:
-            alertas.append(f"**{len(capturas_veloces)}** operaciones consecutivas con menos de 1 minuto de diferencia.")
+        if not capturas_muy_rapidas.empty:
+            alertas.append(f"**{len(capturas_muy_rapidas)}** operaciones consecutivas ultra-rápidas (menos de 20 segundos de diferencia).")
+        if not capturas_pausadas.empty:
+            alertas.append(f"**{len(capturas_pausadas)}** pausas prolongadas entre capturas consecutivas (más de 4 minutos de diferencia).")
         
         st.warning("⚠️ **Banderas Rojas Detectadas en la Operación:**\n" + "\n".join([f"- {a}" for a in alertas]))
 
@@ -155,17 +158,18 @@ def mostrar_pestana_auditoria_usuarios():
             else:
                 st.info("No hay actividad diaria para graficar.")
                 
-    # 💡 MEJORA 4: Gráfico de Dispersión (Mapa temporal de calor)
+    # Gráfico de Dispersión con corrección de valores absolutos para evitar errores en Plotly
     with st.container(border=True):
         st.subheader("⏱️ Mapa Temporal de Capturas (Patrones de horario)")
         if not df_filtrado.empty:
-            # Tamaño dinámico de los puntos basado en el importe
+            df_filtrado['TOTAL_ABS'] = df_filtrado['TOTAL'].abs()
+
             fig_scatter = px.scatter(
                 df_filtrado, 
                 x='FECHA_CAPTURA', 
                 y='HORA_EXACTA', 
                 color='MODULO', 
-                size='TOTAL',
+                size='TOTAL_ABS', 
                 hover_data=['USUARIO', 'TOTAL'],
                 color_discrete_sequence=px.colors.qualitative.Safe,
                 labels={"HORA_EXACTA": "Hora del Día (0h - 24h)", "FECHA_CAPTURA": "Fecha"}
@@ -173,7 +177,7 @@ def mostrar_pestana_auditoria_usuarios():
             fig_scatter.update_layout(
                 height=300, 
                 margin=dict(t=10, b=10, l=10, r=10), 
-                yaxis=dict(range=[-1, 25], tick0=0, dtick=2) # Fija el eje Y de 0 a 24 horas
+                yaxis=dict(range=[-1, 25], tick0=0, dtick=2)
             )
             st.plotly_chart(fig_scatter, use_container_width=True)
         else:
@@ -181,7 +185,7 @@ def mostrar_pestana_auditoria_usuarios():
             
     st.divider()
     
-    # 💡 MEJORA 5: Botón de Exportación CSV a un lado del título de la tabla
+    # Tabla con Botón de Exportación CSV
     col_title, col_btn = st.columns([3, 1])
     with col_title:
         st.markdown("#### 📋 Últimos Movimientos Registrados")
