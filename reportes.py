@@ -73,7 +73,6 @@ def obtener_metricas_auditoria_usuarios(fecha_inicio: date, fecha_fin: date) -> 
     if fecha_fin < fecha_inicio:
         raise ValueError("fecha_fin debe ser >= fecha_inicio")
 
-    # Calculamos en Python el límite exclusivo para no bloquear índices de SQL
     fecha_fin_exclusiva = fecha_fin + timedelta(days=1)
 
     query = text("""
@@ -340,9 +339,13 @@ def mostrar_pestana_reportes():
 
 
 def mostrar_pestana_auditoria_usuarios():
-    """Renderiza la pestaña de Auditoría de Usuarios."""
+    """Renderiza la pestaña de Auditoría de Usuarios con validaciones ampliadas y modo debug."""
     st.sidebar.header("👤 Filtros de Auditoría")
 
+    # Debug toggle (no mostrado por defecto)
+    debug_mode = st.sidebar.checkbox("Mostrar debug (df_logs)", value=False)
+
+    # Rango de fechas por defecto: últimos 30 días
     hoy = date.today()
     hace_un_mes = hoy - timedelta(days=30)
 
@@ -352,49 +355,93 @@ def mostrar_pestana_auditoria_usuarios():
         max_value=hoy
     )
 
-    if isinstance(fechas_sel, tuple) and len(fechas_sel) == 2:
-        f_inicio, f_fin = fechas_sel
-    else:
+    # Validar selección de fechas
+    if not (isinstance(fechas_sel, tuple) and len(fechas_sel) == 2):
         st.info("Selecciona la fecha inicial y final en el menú lateral.")
         return
+    f_inicio, f_fin = fechas_sel
+    if f_fin < f_inicio:
+        st.error("La fecha final debe ser mayor o igual a la inicial.")
+        return
 
+    # Botón para invalidar cache y recargar
     if st.sidebar.button("🔄 Sincronizar Logs", use_container_width=True, key="sync_auditoria"):
         try:
             obtener_metricas_auditoria_usuarios.clear()
         except Exception:
-            logger.debug("No se pudo limpiar cache de auditoría")
+            logger.debug("No se pudo limpiar cache de obtener_metricas_auditoria_usuarios")
         st.success("¡Logs actualizados!")
         st.rerun()
 
+    # Obtener datos desde la capa de datos (función cacheada)
     df_logs = obtener_metricas_auditoria_usuarios(f_inicio, f_fin)
+
+    # Debug visual opcional
+    if debug_mode:
+        st.write("DEBUG: df_logs (raw)", None if df_logs is None else df_logs.head(20))
+        st.write("DEBUG: df_logs shape", None if df_logs is None else df_logs.shape)
+        st.write("DEBUG: df_logs columns", None if df_logs is None else df_logs.columns.tolist())
+        st.write("DEBUG: df_logs dtypes", None if df_logs is None else df_logs.dtypes.to_dict())
+
+    # Validaciones básicas
     if df_logs is None or df_logs.empty:
         st.warning(f"No se encontraron registros de captura entre {f_inicio} y {f_fin}.")
         return
 
-    # Comprobación de Categorical compatible con versiones modernas de Pandas
-    is_cat = isinstance(df_logs['USUARIO'].dtype, pd.CategoricalDtype) if 'USUARIO' in df_logs.columns else False
-    usuarios_cat = list(df_logs['USUARIO'].cat.categories) if is_cat else sorted(df_logs['USUARIO'].astype(str).unique())
-    
+    # Asegurar FECHA_CAPTURA como datetime
+    if 'FECHA_CAPTURA' not in df_logs.columns:
+        st.error("La columna FECHA_CAPTURA no está presente en los datos. Revisa la consulta SQL.")
+        return
+    df_logs['FECHA_CAPTURA'] = pd.to_datetime(df_logs['FECHA_CAPTURA'], errors='coerce')
+    if debug_mode:
+        st.write("DEBUG: FECHA_CAPTURA nulls:", int(df_logs['FECHA_CAPTURA'].isna().sum()))
+
+    # Asegurar USUARIO presente y normalizado
+    if 'USUARIO' not in df_logs.columns:
+        st.error("La columna USUARIO no está presente en los datos. Revisa la consulta SQL.")
+        return
+    df_logs['USUARIO'] = df_logs['USUARIO'].astype(str).str.strip().str.upper()
+
+    # Asegurar modulo y TOTAL si existen, pero no fallar si faltan
+    if 'modulo' not in df_logs.columns:
+        df_logs['modulo'] = 'Desconocido'
+    if 'TOTAL' not in df_logs.columns:
+        df_logs['TOTAL'] = 0.0
+    df_logs['TOTAL'] = pd.to_numeric(df_logs['TOTAL'], errors='coerce').fillna(0.0)
+
+    # Construir lista de usuarios de forma segura (compatible con pandas moderno)
+    if isinstance(df_logs['USUARIO'].dtype, pd.CategoricalDtype):
+        usuarios_cat = list(df_logs['USUARIO'].cat.categories)
+    else:
+        usuarios_cat = sorted(df_logs['USUARIO'].unique())
+
     lista_usuarios = ["Todos"] + usuarios_cat
     usuario_sel = st.sidebar.selectbox("Selecciona Usuario", lista_usuarios, index=0)
 
+    # Filtrar por usuario si aplica
     if usuario_sel and usuario_sel != "Todos":
-        df_logs = df_logs[df_logs['USUARIO'].astype(str) == usuario_sel]
+        before_count = len(df_logs)
+        df_logs = df_logs[df_logs['USUARIO'] == usuario_sel]
+        after_count = len(df_logs)
+        if debug_mode:
+            st.write(f"DEBUG: Filtrado por usuario {usuario_sel}: {before_count} -> {after_count} filas")
 
-    # Cálculos vectorizados
+    # Ordenar y calcular diferencias entre capturas por usuario
     df_logs = df_logs.sort_values(['USUARIO', 'FECHA_CAPTURA'])
     df_logs['diferencia_minutos'] = df_logs.groupby('USUARIO', observed=False)['FECHA_CAPTURA'].diff().dt.total_seconds() / 60.0
 
+    # Capturas continuas (<= 30 minutos)
     capturas_continuas = df_logs[df_logs['diferencia_minutos'] <= 30]
     tiempo_promedio_captura = capturas_continuas['diferencia_minutos'].mean()
     tiempo_prom_str = f"{tiempo_promedio_captura:.1f} min" if pd.notnull(tiempo_promedio_captura) else "N/A"
 
+    # Jornada diaria por usuario
     df_logs['FECHA_DIA'] = df_logs['FECHA_CAPTURA'].dt.date
     jornadas = df_logs.groupby(['USUARIO', 'FECHA_DIA'], observed=False)['FECHA_CAPTURA'].agg(['min', 'max'])
     jornadas['horas_activas'] = (jornadas['max'] - jornadas['min']).dt.total_seconds() / 3600.0
     promedio_horas_dia = jornadas[jornadas['horas_activas'] > 0]['horas_activas'].mean()
 
-    # Tarjetas de Métricas Clave
+    # Tarjetas de métricas clave
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total Capturas", f"{len(df_logs):,}")
@@ -407,13 +454,17 @@ def mostrar_pestana_auditoria_usuarios():
 
     st.markdown("---")
 
-    # Gráficos Analíticos
+    # Gráficos analíticos
     col_g1, col_g2 = st.columns(2)
     with col_g1:
         st.markdown("<h4 style='text-align: center;'>Capturas por Módulo</h4>", unsafe_allow_html=True)
-        fig_modulo = px.pie(df_logs, names='modulo', values='TOTAL', hole=0.4, color_discrete_sequence=px.colors.qualitative.Set2)
-        fig_modulo.update_layout(height=280, margin=dict(t=20, b=20, l=10, r=10))
-        st.plotly_chart(fig_modulo, use_container_width=True)
+        df_modulo = df_logs.groupby('modulo', observed=False)['TOTAL'].sum().reset_index()
+        if not df_modulo.empty:
+            fig_modulo = px.pie(df_modulo, names='modulo', values='TOTAL', hole=0.4, color_discrete_sequence=px.colors.qualitative.Set2)
+            fig_modulo.update_layout(height=280, margin=dict(t=20, b=20, l=10, r=10))
+            st.plotly_chart(fig_modulo, use_container_width=True)
+        else:
+            st.info("No hay datos por módulo para graficar.")
 
     with col_g2:
         st.markdown("<h4 style='text-align: center;'>Actividad Diaria (Volumen)</h4>", unsafe_allow_html=True)
@@ -425,14 +476,22 @@ def mostrar_pestana_auditoria_usuarios():
         else:
             st.info("No hay actividad diaria para graficar.")
 
-    # Tabla Detallada
+    # Tabla detallada (limitada a 100 filas)
     st.markdown("#### Últimos Movimientos Registrados")
     cols_to_show = ['FECHA_CAPTURA', 'USUARIO', 'modulo', 'TOTAL']
     cols_present = [c for c in cols_to_show if c in df_logs.columns]
-    st.dataframe(
-        df_logs[cols_present].sort_values('FECHA_CAPTURA', ascending=False).head(100),
-        use_container_width=True
-    )
+    if cols_present:
+        st.dataframe(
+            df_logs[cols_present].sort_values('FECHA_CAPTURA', ascending=False).head(100),
+            use_container_width=True
+        )
+    else:
+        st.info("No hay columnas disponibles para mostrar en la tabla.")
+
+    # Si debug activo, mostrar resumen final
+    if debug_mode:
+        st.write("DEBUG: resumen jornadas (primeras filas)", jornadas.reset_index().head(10))
+        st.write("DEBUG: conteos por modulo", df_modulo if 'df_modulo' in locals() else "no existe")
 
 # -------------------------
 # Main
