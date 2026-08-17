@@ -33,7 +33,19 @@ def obtener_metricas_auditoria_usuarios(fecha_inicio: date, fecha_fin: date) -> 
             
         df.rename(columns={'modulo': 'MODULO'}, inplace=True)
         df.columns = df.columns.str.upper()
+        
+        # ---------------------------------------------------------------------
+        # 💡 CORRECCIÓN DE ZONA HORARIA: UTC -> CDMX
+        # ---------------------------------------------------------------------
         df['FECHA_CAPTURA'] = pd.to_datetime(df['FECHA_CAPTURA'], errors='coerce')
+        df['FECHA_CAPTURA'] = (
+            df['FECHA_CAPTURA']
+            .dt.tz_localize('UTC')                     # Asumimos que la BD guarda en UTC
+            .dt.tz_convert('America/Mexico_City')      # Convertimos a huso horario de CDMX
+            .dt.tz_localize(None)                      # Quitamos el timezone para evitar errores con Plotly/Streamlit
+        )
+        # ---------------------------------------------------------------------
+        
         df['USUARIO'] = df['USUARIO'].astype(str).str.strip().str.upper()
         df['TOTAL'] = pd.to_numeric(df['TOTAL'], errors='coerce').fillna(0.0).astype('float64')
         return df
@@ -58,7 +70,7 @@ def mostrar_pestana_auditoria_usuarios():
     if f_fin < f_inicio:
         st.error("❌ La fecha final debe ser mayor o igual a la inicial.")
         return
-        
+       
     if st.sidebar.button("🔄 Sincronizar Logs", use_container_width=True, key="sync_auditoria"):
         try:
             obtener_metricas_auditoria_usuarios.clear()
@@ -90,7 +102,7 @@ def mostrar_pestana_auditoria_usuarios():
         return
         
     df_filtrado = df_filtrado.sort_values(['USUARIO', 'FECHA_CAPTURA'])
-    
+   
     # 💡 CÁLCULO DE DIFERENCIAS EN SEGUNDOS Y MINUTOS
     df_filtrado['DIFERENCIA_SEGUNDOS'] = df_filtrado.groupby('USUARIO', observed=False)['FECHA_CAPTURA'].diff().dt.total_seconds()
     df_filtrado['DIFERENCIA_MINUTOS'] = df_filtrado['DIFERENCIA_SEGUNDOS'] / 60.0
@@ -104,7 +116,7 @@ def mostrar_pestana_auditoria_usuarios():
     jornadas = df_filtrado.groupby(['USUARIO', 'FECHA_DIA'], observed=False)['FECHA_CAPTURA'].agg(['min', 'max'])
     jornadas['HORAS_ACTIVAS'] = (jornadas['max'] - jornadas['min']).dt.total_seconds() / 3600.0
     promedio_horas = jornadas[jornadas['HORAS_ACTIVAS'] > 0]['HORAS_ACTIVAS'].mean()
-    
+ 
     st.title("📊 Cuadro de Mando: Auditoría de Usuarios")
     st.caption(f"Rango: **{f_inicio}** al **{f_fin}** | Filtro: **{usuario_sel}**")
     
