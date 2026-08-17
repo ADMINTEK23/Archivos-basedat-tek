@@ -15,7 +15,6 @@ if st.session_state.get("autenticado", False):
     # 2. Configurar las opciones visibles según el rol
     lista_opciones = []
     if rol == "admin":
-        # 💡 AGREGADO: "👤 Auditoría de Usuarios" al menú de admin
         lista_opciones = [
             "📊 Gráficos y Reportes", 
             "📝 Capturar Transacciones", 
@@ -48,8 +47,8 @@ if st.session_state.get("autenticado", False):
         elif vista_actual == "✂️ Traspasos":
             importlib.import_module("cortedia").mostrar_modulo_traspasos()
 
-        # 💡 AGREGADO: Mapeo hacia la función de auditoría en reportes.py
+        # 💡 CORRECCIÓN: Ahora apunta al nuevo archivo auditoria.py
         elif vista_actual == "👤 Auditoría de Usuarios":
-            importlib.import_module("reportes").mostrar_pestana_auditoria_usuarios()
+            importlib.import_module("auditoria").mostrar_pestana_auditoria_usuarios()
 else:
     st.stop()

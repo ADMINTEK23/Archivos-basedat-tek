@@ -56,7 +56,7 @@ def ejecutar_login():
         })
 
     if not st.session_state["autenticado"]:
-        st.title("🔐 Control de Acceso")
+        st.title("CONTINÚA CON:")
         with st.form("formulario_login"):
             usuario_input = st.text_input("Usuario")
             password_input = st.text_input("Contraseña", type="password")
