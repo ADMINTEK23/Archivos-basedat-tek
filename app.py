@@ -8,15 +8,21 @@ ejecutar_login()
 if st.session_state.get("autenticado", False):
     rol = st.session_state.get("rol_actual", "")
 
-    # --- CORRECCIÓN DEFINITIVA: INICIALIZAR CONTADORES DE TABLAS MASIVAS ---
-    # setdefault es más eficiente y limpio para inicializar variables si no existen
+    # --- INICIALIZAR CONTADORES DE TABLAS MASIVAS ---
     st.session_state.setdefault("version_tabla_insumos", 0)
     st.session_state.setdefault("version_tabla_gastos", 0)
 
     # 2. Configurar las opciones visibles según el rol
     lista_opciones = []
     if rol == "admin":
-        lista_opciones = ["📊 Gráficos y Reportes", "📝 Capturar Transacciones", "📋 Resumen de Capturas", "✂️ Traspasos"]
+        # 💡 AGREGADO: "👤 Auditoría de Usuarios" al menú de admin
+        lista_opciones = [
+            "📊 Gráficos y Reportes", 
+            "📝 Capturar Transacciones", 
+            "📋 Resumen de Capturas", 
+            "✂️ Traspasos",
+            "👤 Auditoría de Usuarios"
+        ]
     elif rol == "viewer":
         lista_opciones = ["📊 Gráficos y Reportes", "📋 Resumen de Capturas"]
     elif rol == "operator":
@@ -26,11 +32,10 @@ if st.session_state.get("autenticado", False):
         st.stop()
 
     if lista_opciones:
-        # MENÚ LATERAL: Esto evita que Streamlit ejecute todas las pantallas a la vez
+        # MENÚ LATERAL
         vista_actual = st.sidebar.radio("Navegación", lista_opciones)
         
         # --- MAPEO DE FUNCIONES CON IMPORTLIB ---
-        # Solo se importa y ejecuta el módulo de la vista que el usuario seleccionó
         if vista_actual == "📊 Gráficos y Reportes":
             importlib.import_module("reportes").mostrar_pestana_reportes()
             
@@ -42,5 +47,9 @@ if st.session_state.get("autenticado", False):
             
         elif vista_actual == "✂️ Traspasos":
             importlib.import_module("cortedia").mostrar_modulo_traspasos()
+
+        # 💡 AGREGADO: Mapeo hacia la función de auditoría en reportes.py
+        elif vista_actual == "👤 Auditoría de Usuarios":
+            importlib.import_module("reportes").mostrar_pestana_auditoria_usuarios()
 else:
     st.stop()
