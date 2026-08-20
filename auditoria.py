@@ -143,7 +143,8 @@ def _clear_caches_for_tables(tables: Optional[Iterable[str]] = None) -> None:
         "auditoria": obtener_metricas_auditoria_usuarios,
         "marcas": obtener_marcas_activas,
         "resumen": obtener_resumen_usuario_rango_cached,
-        "banderas": obtener_banderas_rojas
+        "banderas": obtener_banderas_rojas,
+        "mapa": obtener_datos_mapa_temporal
     }
     if tables is None:
         targets = cache_funcs.values()
@@ -174,11 +175,11 @@ def obtener_metricas_auditoria_usuarios(fecha_inicio: date, fecha_fin: date) -> 
            COUNT(*) AS ops, SUM(COALESCE(total,0)) AS total_sum, SUM(COALESCE(corregido,0)) AS total_corregido,
            MIN(fecha_cap) AS first_ts, MAX(fecha_cap) AS last_ts
     FROM (
-      SELECT 'ventas' AS modulo, "USUARIO" AS usuario, "FECHA_CAPTURA" AS fecha_cap, "TOTAL"::numeric AS total, 0 AS corregido FROM ventas WHERE "FECHA_CAPTURA" >= :inicio AND "FECHA_CAPTURA" < :fin_ex
+      SELECT 'Ventas' AS modulo, "USUARIO" AS usuario, "FECHA_CAPTURA" AS fecha_cap, "TOTAL"::numeric AS total, 0 AS corregido FROM ventas WHERE "FECHA_CAPTURA" >= :inicio AND "FECHA_CAPTURA" < :fin_ex
       UNION ALL 
-      SELECT 'gastos', "USUARIO", "FECHA_CAPTURA", "TOTAL"::numeric, COALESCE("CORREGIDO",0) FROM gastos WHERE "FECHA_CAPTURA" >= :inicio AND "FECHA_CAPTURA" < :fin_ex
+      SELECT 'Gastos', "USUARIO", "FECHA_CAPTURA", "TOTAL"::numeric, COALESCE("CORREGIDO",0) FROM gastos WHERE "FECHA_CAPTURA" >= :inicio AND "FECHA_CAPTURA" < :fin_ex
       UNION ALL 
-      SELECT 'insumos', "USUARIO", "FECHA_CAPTURA", "TOTAL"::numeric, COALESCE("CORREGIDO",0) FROM insumos WHERE "FECHA_CAPTURA" >= :inicio AND "FECHA_CAPTURA" < :fin_ex
+      SELECT 'Insumos', "USUARIO", "FECHA_CAPTURA", "TOTAL"::numeric, COALESCE("CORREGIDO",0) FROM insumos WHERE "FECHA_CAPTURA" >= :inicio AND "FECHA_CAPTURA" < :fin_ex
     ) t 
     GROUP BY modulo, usuario, date_trunc('day', fecha_cap) 
     ORDER BY dia, usuario
@@ -232,10 +233,7 @@ def obtener_banderas_rojas(fecha_inicio: date, fecha_fin: date, usuario: Optiona
 
         df['ts'] = normalize_ts_series(df['ts'])
         
-        # 1. Registros de madrugada (< 6:00 AM)
         madrugada_cnt = int((df['ts'].dt.hour < 6).sum())
-        
-        # 2 y 3. Tiempos entre operaciones consecutivas por usuario
         df['diff_sec'] = df.groupby('USUARIO')['ts'].diff().dt.total_seconds()
         ultrarrapidas_cnt = int(((df['diff_sec'] > 0) & (df['diff_sec'] < 20)).sum())
         pausas_cnt = int((df['diff_sec'] > 240).sum())
@@ -248,6 +246,41 @@ def obtener_banderas_rojas(fecha_inicio: date, fecha_fin: date, usuario: Optiona
     except SQLAlchemyError:
         logger.exception("Error en obtener_banderas_rojas")
         return {"madrugada": 0, "ultrarrapidas": 0, "pausas": 0}
+
+@st.cache_data(ttl=TTL_AUDITORIA, show_spinner=False)
+def obtener_datos_mapa_temporal(fecha_inicio: date, fecha_fin: date, usuario: Optional[str] = None) -> pd.DataFrame:
+    """Extrae las fechas exactas de captura para graficar el mapa de burbujas en el tiempo."""
+    if fecha_fin < fecha_inicio:
+        return pd.DataFrame()
+    fin_ex = fecha_fin + timedelta(days=1)
+    
+    user_cond = ' AND "USUARIO" = :u ' if usuario and usuario != "Todos" else ""
+    params = {"inicio": fecha_inicio, "fin_ex": fin_ex}
+    if user_cond:
+        params["u"] = str(usuario).strip().upper()
+
+    q = text(f"""
+    SELECT 'Ventas' AS modulo, "FECHA_CAPTURA" AS ts FROM ventas WHERE "FECHA_CAPTURA" >= :inicio AND "FECHA_CAPTURA" < :fin_ex {user_cond}
+    UNION ALL
+    SELECT 'Gastos' AS modulo, "FECHA_CAPTURA" AS ts FROM gastos WHERE "FECHA_CAPTURA" >= :inicio AND "FECHA_CAPTURA" < :fin_ex {user_cond}
+    UNION ALL
+    SELECT 'Insumos' AS modulo, "FECHA_CAPTURA" AS ts FROM insumos WHERE "FECHA_CAPTURA" >= :inicio AND "FECHA_CAPTURA" < :fin_ex {user_cond}
+    """)
+    
+    try:
+        with ENGINE_GLOBAL.connect() as conn:
+            df = pd.read_sql(q, conn, params=params)
+        
+        if not df.empty:
+            df['ts'] = normalize_ts_series(df['ts'])
+            df.dropna(subset=['ts'], inplace=True)
+            # Calcular la hora en decimal para el eje Y (ej: 14:30 -> 14.5)
+            df['Hora_Numerica'] = df['ts'].dt.hour + (df['ts'].dt.minute / 60.0)
+            df['Cantidad'] = 10 # Tamaño base para la burbuja
+        return df
+    except SQLAlchemyError:
+        logger.exception("Error en obtener_datos_mapa_temporal")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=300, show_spinner=False)
 def obtener_marcas_activas() -> List[str]:
@@ -369,7 +402,7 @@ def fetch_page(
         return pd.DataFrame(columns=[c.upper() for c in select_cols])
 
 # -------------------------
-# Servicio: Guardar Correcciones (Desacoplado de UI)
+# Servicio: Guardar Correcciones
 # -------------------------
 def guardar_correcciones_db_batch(
     nombre_tabla: str, cambios: Dict[str, Dict[str, Any]], df_original: pd.DataFrame,
@@ -543,15 +576,33 @@ def mostrar_pestana_auditoria_usuarios():
     else:
         st.info("No se registran correcciones en el periodo seleccionado.")
 
+    # -------------------------
+    # Visualizaciones Actualizadas
+    # -------------------------
     st.divider()
     st.subheader("Visualizaciones")
+    
+    # Definir el mapa de colores fijo para todas las gráficas
+    colores_fijos = {
+        "Ventas": "#3b75af",   # Azul
+        "Insumos": "#ffc000",  # Amarillo
+        "Gastos": "#70ad47"    # Verde
+    }
+    
     g1, g2 = st.columns(2)
     
     with g1:
         st.markdown("**Distribución tipo de captura**")
         df_mod = df_filtrado.groupby('MODULO', observed=False)['TOTAL_SUM'].sum().reset_index()
         if not df_mod.empty and df_mod['TOTAL_SUM'].sum() > 0:
-            fig_pie = px.pie(df_mod, names='MODULO', values='TOTAL_SUM', hole=0.4, color_discrete_sequence=px.colors.qualitative.Safe)
+            fig_pie = px.pie(
+                df_mod, 
+                names='MODULO', 
+                values='TOTAL_SUM', 
+                hole=0.4, 
+                color='MODULO',
+                color_discrete_map=colores_fijos
+            )
             fig_pie.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10), legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig_pie, use_container_width=True)
         else:
@@ -559,13 +610,67 @@ def mostrar_pestana_auditoria_usuarios():
             
     with g2:
         st.markdown("**Volumen de Actividad Diaria**")
-        df_tend = df_filtrado.groupby(['DIA', 'MODULO'], observed=False).size().reset_index(name='OPERACIONES')
+        # CORRECCIÓN: Sumar la columna 'OPS' en lugar de usar .size()
+        df_tend = df_filtrado.groupby(['DIA', 'MODULO'], observed=False)['OPS'].sum().reset_index(name='OPERACIONES')
         if not df_tend.empty:
-            fig_line = px.line(df_tend, x='DIA', y='OPERACIONES', color='MODULO', markers=True, color_discrete_sequence=px.colors.qualitative.Safe)
+            fig_line = px.line(
+                df_tend, 
+                x='DIA', 
+                y='OPERACIONES', 
+                color='MODULO', 
+                markers=True, 
+                color_discrete_map=colores_fijos
+            )
             fig_line.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10), xaxis_title=None, legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig_line, use_container_width=True)
         else:
             st.info("Sin actividad diaria para graficar.")
+            
+    # Mapa Temporal de Capturas
+    st.markdown("---")
+    st.markdown("**⏱️ Mapa Temporal de Capturas (Patrones de horario)**")
+    
+    with st.spinner("Cargando mapa temporal..."):
+        df_mapa = obtener_datos_mapa_temporal(f_inicio, f_fin, usuario_sel)
+        
+    if not df_mapa.empty:
+        fig_mapa = px.scatter(
+            df_mapa,
+            x="ts",
+            y="Hora_Numerica",
+            color="modulo",
+            size="Cantidad",
+            color_discrete_map=colores_fijos, # Aplicando los mismos colores fijos
+            labels={
+                "ts": "Fecha",
+                "Hora_Numerica": "Hora del Día (0h - 24h)",
+                "modulo": "MÓDULO"
+            },
+            size_max=12
+        )
+        
+        fig_mapa.update_layout(
+            plot_bgcolor="white",
+            yaxis=dict(
+                tickmode="linear",
+                tick0=0,
+                dtick=2,
+                range=[-1, 25], 
+                showgrid=True,
+                gridcolor="#E0E0E0"
+            ),
+            xaxis=dict(
+                showgrid=True,
+                gridcolor="#E0E0E0"
+            ),
+            height=350,
+            margin=dict(t=20, b=10, l=10, r=10),
+            legend_title="MODULO"
+        )
+        
+        st.plotly_chart(fig_mapa, use_container_width=True)
+    else:
+        st.info("Sin datos exactos de captura en el rango seleccionado para trazar el mapa temporal.")
 
     st.divider()
     st.subheader("📋 Últimos Movimientos Capturados")
