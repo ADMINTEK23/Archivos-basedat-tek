@@ -235,7 +235,7 @@ def guardar_correcciones_db_batch(nombre_tabla: str, cambios: Dict[str, Dict[str
                 logger.exception("Normalización fallida para id=%s col=%s val=%s", row_id, c, raw)
                 raise
 
-        # validación de respaldo en servidor: no permitir valores exactamente 0 en campos monetarios/unidad/total
+        # validación de respaldo en servidor: no permitir valores en 0 en campos monetarios/unidad/total
         for col_name, norm_val in zip(cols, normalized_vals):
             if col_name in {"COSTO", "UNIDAD", "TOTAL"} and norm_val is not None:
                 try:
@@ -324,7 +324,8 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
 
     # Manejo de la tabla interactiva
     if nombre_tabla in ["insumos", "gastos"]:
-        columnas_editables = ["FECHA", "FORMA PAGO", "UNIDAD", "COSTO", "MARCA", "TIPO", "RECURRENCIA"]
+        # Se elimina "TIPO" de la lista de columnas editables
+        columnas_editables = ["FECHA", "FORMA PAGO", "UNIDAD", "COSTO", "MARCA", "RECURRENCIA"]
         todas_las_columnas = df_pagina.columns.tolist()
         columnas_deshabilitadas = [c for c in todas_las_columnas if c not in columnas_editables]
         editor_key = f"editor_{nombre_tabla}_{pagina_actual}"
@@ -335,11 +336,11 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
         edited_df = st.data_editor(df_pagina, use_container_width=True, hide_index=True, disabled=columnas_deshabilitadas, key=editor_key, column_config={
             "ID": None,
             "FECHA": st.column_config.DateColumn("FECHA", format="YYYY-MM-DD", width="small"),
+            "FORMA PAGO": st.column_config.SelectboxColumn("FORMA PAGO", options=["EFECTIVO", "TARJETA", "TRANSFERENCIA"]),
             "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%.2f", step=0.01),
             "COSTO": st.column_config.NumberColumn("COSTO", format="$%.2f", step=0.01),
             "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.2f", step=0.01),
             "MARCA": st.column_config.SelectboxColumn("MARCA", options=marcas_opciones),
-            "TIPO": st.column_config.SelectboxColumn("TIPO", options=["OPERATIVO", "NO OPERATIVO", "INVERSIÓN"]),
             "RECURRENCIA": st.column_config.SelectboxColumn("RECURRENCIA", options=recurrencias_opciones)
         })
         
