@@ -53,6 +53,7 @@ def _normalize_value(col: str, val: Any) -> Any:
     cu = col.upper()
     try:
         if cu in {"COSTO", "TOTAL", "UNIDAD", "CANTIDAD"}:
+            # Mantener Decimal para precisión
             return Decimal(str(val))
         if cu == "FECHA":
             if isinstance(val, (date, datetime)):
@@ -78,6 +79,17 @@ def obtener_marcas_activas() -> List[str]:
     except SQLAlchemyError:
         logger.exception("Error al obtener marcas")
         return ["TODAS LAS MARCAS"]
+
+@st.cache_data(ttl=300, show_spinner=False)
+def obtener_recurrencias_activas() -> List[str]:
+    q = text('SELECT DISTINCT UPPER(TRIM("RECURRENCIA")) FROM gastos WHERE "RECURRENCIA" IS NOT NULL')
+    try:
+        with ENGINE_GLOBAL.connect() as conn:
+            res = conn.execute(q).fetchall()
+            return sorted([r[0] for r in res if r[0]])
+    except SQLAlchemyError:
+        logger.exception("Error al obtener recurrencias")
+        return []
 
 @st.cache_data(ttl=300, show_spinner=False)
 def obtener_resumen_usuario_rango_cached(usuario: str, fecha_inicio: date, fecha_fin: date, tipo_filtro: str, marca_filtro: str) -> Dict[str, Any]:
@@ -128,6 +140,10 @@ def _clear_caches():
     except Exception:
         pass
     try:
+        obtener_recurrencias_activas.clear()
+    except Exception:
+        pass
+    try:
         obtener_resumen_usuario_rango_cached.clear()
     except Exception:
         pass
@@ -147,7 +163,6 @@ def fetch_page(table: str, select_cols: List[str], usuario: str, col_date_expr: 
         params["m"] = marca_filtro
     cols_sql = ", ".join([f'"{c}"' for c in select_cols])
     if cursor and cursor[0] is not None and cursor[1] is not None:
-        # paginación por cursor (fecha, id) para tablas grandes
         params.update({"last_fecha": cursor[0], "last_id": cursor[1]})
         q = text(f'SELECT {cols_sql} FROM {t} WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin {condicion_marca} AND ( "FECHA" < :last_fecha OR ( "FECHA" = :last_fecha AND id < :last_id ) ) ORDER BY "FECHA" DESC, id DESC LIMIT :limit')
     else:
@@ -170,6 +185,24 @@ def fetch_page(table: str, select_cols: List[str], usuario: str, col_date_expr: 
 def guardar_correcciones_db_batch(nombre_tabla: str, cambios: Dict[str, Dict[str, Any]], df_original: pd.DataFrame, batch_size: int = 200, usuario_actual: Optional[str] = None):
     if not cambios:
         return
+        
+    # --- AUTO-CÁLCULAR TOTAL (usar Decimal para precisión) ---
+    for row_idx, cols_changed in cambios.items():
+        if "UNIDAD" in cols_changed or "COSTO" in cols_changed:
+            try:
+                idx = int(row_idx)
+                val_u = cols_changed.get("UNIDAD", df_original.iloc[idx].get("UNIDAD", 0))
+                val_c = cols_changed.get("COSTO", df_original.iloc[idx].get("COSTO", 0))
+
+                u = Decimal(str(val_u)) if pd.notna(val_u) else Decimal(0)
+                c = Decimal(str(val_c)) if pd.notna(val_c) else Decimal(0)
+
+                # Guardar como Decimal (no float) para mantener precisión
+                cols_changed["TOTAL"] = u * c
+            except Exception as e:
+                logger.error(f"Error calculando TOTAL para fila {row_idx}: {e}")
+    # -----------------------------------
+
     t = validar_tabla(nombre_tabla)
     allowed_cols = columnas_permitidas_para_tabla(t)
     cols_set = set()
@@ -201,6 +234,17 @@ def guardar_correcciones_db_batch(nombre_tabla: str, cambios: Dict[str, Dict[str
             except ValueError as e:
                 logger.exception("Normalización fallida para id=%s col=%s val=%s", row_id, c, raw)
                 raise
+
+        # validación de respaldo en servidor: no permitir valores exactamente 0 en campos monetarios/unidad/total
+        for col_name, norm_val in zip(cols, normalized_vals):
+            if col_name in {"COSTO", "UNIDAD", "TOTAL"} and norm_val is not None:
+                try:
+                    v_dec = Decimal(str(norm_val))
+                except (InvalidOperation, TypeError):
+                    raise ValueError(f"Valor inválido para {col_name} en id={row_id}: {norm_val}")
+                if v_dec == Decimal("0"):
+                    raise ValueError(f"No se permiten valores 0 en {col_name} para id={row_id}. Usa un valor distinto de 0.")
+
         rows_params.append((row_id, *normalized_vals))
     if not rows_params:
         return
@@ -262,7 +306,6 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
     with col_izq:
         if st.button("⬅️ Anterior", key=f"prev_{nombre_tabla}", disabled=(pagina_actual <= 0)):
             st.session_state[estado_key] = max(0, pagina_actual - 1)
-            # Al retroceder limpiamos el cursor para depender del OFFSET matemático seguro
             st.session_state.pop(f"cursor_{nombre_tabla}", None)
             st.rerun()
             
@@ -272,7 +315,6 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
     with col_der:
         if st.button("Siguiente ➡️", key=f"next_{nombre_tabla}", disabled=((pagina_actual + 1) >= total_paginas)):
             st.session_state[estado_key] = min(total_paginas - 1, pagina_actual + 1)
-            # Guardamos el cursor de la última fila para la siguiente página
             if not df_pagina.empty:
                 last_fecha = df_pagina.iloc[-1].get("FECHA")
                 last_id = df_pagina.iloc[-1].get("ID")
@@ -282,41 +324,84 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
 
     # Manejo de la tabla interactiva
     if nombre_tabla in ["insumos", "gastos"]:
-        columnas_editables = ["FECHA", "FORMA PAGO", "UNIDAD", "COSTO", "TOTAL"]
+        columnas_editables = ["FECHA", "FORMA PAGO", "UNIDAD", "COSTO", "MARCA", "TIPO", "RECURRENCIA"]
         todas_las_columnas = df_pagina.columns.tolist()
         columnas_deshabilitadas = [c for c in todas_las_columnas if c not in columnas_editables]
         editor_key = f"editor_{nombre_tabla}_{pagina_actual}"
         
+        marcas_opciones = [m for m in obtener_marcas_activas() if m != "TODAS LAS MARCAS"]
+        recurrencias_opciones = obtener_recurrencias_activas()
+        
         edited_df = st.data_editor(df_pagina, use_container_width=True, hide_index=True, disabled=columnas_deshabilitadas, key=editor_key, column_config={
             "ID": None,
             "FECHA": st.column_config.DateColumn("FECHA", format="YYYY-MM-DD", width="small"),
-            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%.2f", step=0.01, min_value=0.0),
-            "COSTO": st.column_config.NumberColumn("COSTO", format="$%.2f", step=0.01, min_value=0.0),
-            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.2f", step=0.01, min_value=0.0)
+            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%.2f", step=0.01),
+            "COSTO": st.column_config.NumberColumn("COSTO", format="$%.2f", step=0.01),
+            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.2f", step=0.01),
+            "MARCA": st.column_config.SelectboxColumn("MARCA", options=marcas_opciones),
+            "TIPO": st.column_config.SelectboxColumn("TIPO", options=["OPERATIVO", "NO OPERATIVO", "INVERSIÓN"]),
+            "RECURRENCIA": st.column_config.SelectboxColumn("RECURRENCIA", options=recurrencias_opciones)
         })
         
         cambios_detectados = st.session_state.get(editor_key, {}).get("edited_rows", {})
         
-        if cambios_detectados:
-            guardar_key = f"guardar_{nombre_tabla}_{pagina_actual}"
-            estado_guardando = f"guardando_{nombre_tabla}"
-            
-            # Bloqueador de doble clic
-            if estado_guardando not in st.session_state:
-                st.session_state[estado_guardando] = False
+        # Validación amigable en frontend: detectar valores en 0 proyectados
+        filas_invalidas = []
+        for row_idx, cols_changed in cambios_detectados.items():
+            try:
+                idx = int(row_idx)
+                
+                # 1. Obtener valores editados o caer en los originales si no se editaron
+                val_u = cols_changed.get("UNIDAD", df_pagina.iloc[idx].get("UNIDAD", 0))
+                val_c = cols_changed.get("COSTO", df_pagina.iloc[idx].get("COSTO", 0))
+                
+                u = Decimal(str(val_u)) if pd.notna(val_u) else Decimal("0")
+                c = Decimal(str(val_c)) if pd.notna(val_c) else Decimal("0")
+                
+                # 2. Calcular el total tal como lo hará el backend
+                t = u * c
 
-            if st.button(f"💾 Guardar {len(cambios_detectados)} corrección(es) en {nombre_tabla.upper()}", key=guardar_key, disabled=st.session_state[estado_guardando]):
+                # 3. Revisar si alguna de las 3 variables resultó en 0
+                for nombre_campo, valor_campo in [("UNIDAD", u), ("COSTO", c), ("TOTAL", t)]:
+                    if valor_campo == Decimal("0"):
+                        row_id = df_pagina.iloc[idx].get("ID", f"índice {row_idx}")
+                        filas_invalidas.append(f"ID {row_id}: {nombre_campo} resulta en 0")
+                        
+            except (InvalidOperation, TypeError, ValueError):
+                row_id = df_pagina.iloc[int(row_idx)].get("ID", f"índice {row_idx}") if str(row_idx).isdigit() else row_idx
+                filas_invalidas.append(f"ID {row_id}: contiene valores no numéricos inválidos.")
+        
+        guardar_key = f"guardar_{nombre_tabla}_{pagina_actual}"
+        estado_guardando = f"guardando_{nombre_tabla}"
+        if estado_guardando not in st.session_state:
+            st.session_state[estado_guardando] = False
+
+        if filas_invalidas:
+            # Mensaje amigable y claro
+            st.error("No se pueden guardar correcciones con valores en 0 en UNIDAD, COSTO o TOTAL. Corrige las siguientes filas antes de guardar:")
+            for msg in filas_invalidas:
+                st.caption(f"• {msg}")
+            guardar_disabled = True
+        else:
+            guardar_disabled = False
+
+        if cambios_detectados:
+            if st.button(f"💾 Guardar {len(cambios_detectados)} corrección(es) en {nombre_tabla.upper()}", key=guardar_key, disabled=st.session_state[estado_guardando] or guardar_disabled):
                 st.session_state[estado_guardando] = True
                 try:
                     with st.spinner("Guardando correcciones..."):
                         guardar_correcciones_db_batch(nombre_tabla, cambios_detectados, df_pagina)
+                        st.success("✅ Correcciones guardadas correctamente.")
+                except ValueError as ve:
+                    # Mensaje amigable si la validación del servidor falla
+                    logger.exception("Validación fallida al guardar correcciones")
+                    st.error(f"❌ No se guardaron las correcciones: {ve}")
                 except Exception as e:
                     logger.exception("Error guardando correcciones")
                     st.error("❌ Ocurrió un error al guardar. Revisa los datos e inténtalo de nuevo.")
                 finally:
                     st.session_state[estado_guardando] = False
                     
-        # Escuchador del refresco automático tras guardar
         if st.session_state.get("refresh_flag"):
             st.session_state["refresh_flag"] = False
             st.rerun()
