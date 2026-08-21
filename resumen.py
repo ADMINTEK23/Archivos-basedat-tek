@@ -148,8 +148,8 @@ def _clear_caches():
     except Exception:
         pass
 
-# --- Fetch con paginación (OFFSET o cursor) ---
-def fetch_page(table: str, select_cols: List[str], usuario: str, col_date_expr: str, fecha_inicio: date, fecha_fin: date, marca_filtro: str, limit: int = 50, offset: int = 0, cursor: Optional[Tuple[Optional[date], Optional[int]]] = None) -> pd.DataFrame:
+# --- Fetch con paginación (OFFSET sin cursor para evitar duplicidad) ---
+def fetch_page(table: str, select_cols: List[str], usuario: str, col_date_expr: str, fecha_inicio: date, fecha_fin: date, marca_filtro: str, limit: int = 100, offset: int = 0) -> pd.DataFrame:
     t = validar_tabla(table)
     cols_allowed = columnas_permitidas_para_tabla(t)
     select_cols_upper = [c.upper() for c in select_cols]
@@ -162,11 +162,9 @@ def fetch_page(table: str, select_cols: List[str], usuario: str, col_date_expr: 
         condicion_marca = ' AND UPPER("MARCA") = :m '
         params["m"] = marca_filtro
     cols_sql = ", ".join([f'"{c}"' for c in select_cols])
-    if cursor and cursor[0] is not None and cursor[1] is not None:
-        params.update({"last_fecha": cursor[0], "last_id": cursor[1]})
-        q = text(f'SELECT {cols_sql} FROM {t} WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin {condicion_marca} AND ( "FECHA" < :last_fecha OR ( "FECHA" = :last_fecha AND id < :last_id ) ) ORDER BY "FECHA" DESC, id DESC LIMIT :limit')
-    else:
-        q = text(f'SELECT {cols_sql} FROM {t} WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin {condicion_marca} ORDER BY "FECHA" DESC LIMIT :limit OFFSET :offset')
+    
+    # Se eliminó la validación del cursor para permitir una paginación exacta usando LIMIT y OFFSET
+    q = text(f'SELECT {cols_sql} FROM {t} WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin {condicion_marca} ORDER BY "FECHA" DESC, id DESC LIMIT :limit OFFSET :offset')
     try:
         with ENGINE_GLOBAL.connect() as conn:
             df = pd.read_sql(q, conn, params=params)
@@ -288,7 +286,7 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
         st.caption(f"No se encontraron registros de {nombre_tabla.upper()} para este periodo y marca.")
         return
         
-    PAGE_SIZE = 50
+    PAGE_SIZE = 100
     estado_key = f"pagina_{nombre_tabla}"
     st.session_state.setdefault(estado_key, 0)
     pagina_actual = st.session_state[estado_key]
@@ -297,16 +295,15 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
     # Preparar parámetros para la extracción
     offset_actual = pagina_actual * PAGE_SIZE
     columnas_sql = meta[nombre_tabla]["cols"]
-    cursor_state = st.session_state.get(f"cursor_{nombre_tabla}", None)
     
-    df_pagina = fetch_page(table=nombre_tabla, select_cols=columnas_sql, usuario=usuario_conectado, col_date_expr=col_date_expr, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin, marca_filtro=marca_filtro, limit=PAGE_SIZE, offset=offset_actual, cursor=cursor_state)
+    # Solicitud limpia basada solo en offset y limit
+    df_pagina = fetch_page(table=nombre_tabla, select_cols=columnas_sql, usuario=usuario_conectado, col_date_expr=col_date_expr, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin, marca_filtro=marca_filtro, limit=PAGE_SIZE, offset=offset_actual)
     
     col_izq, col_centro, col_der = st.columns([1, 2, 1])
     
     with col_izq:
         if st.button("⬅️ Anterior", key=f"prev_{nombre_tabla}", disabled=(pagina_actual <= 0)):
             st.session_state[estado_key] = max(0, pagina_actual - 1)
-            st.session_state.pop(f"cursor_{nombre_tabla}", None)
             st.rerun()
             
     with col_centro:
@@ -315,16 +312,10 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
     with col_der:
         if st.button("Siguiente ➡️", key=f"next_{nombre_tabla}", disabled=((pagina_actual + 1) >= total_paginas)):
             st.session_state[estado_key] = min(total_paginas - 1, pagina_actual + 1)
-            if not df_pagina.empty:
-                last_fecha = df_pagina.iloc[-1].get("FECHA")
-                last_id = df_pagina.iloc[-1].get("ID")
-                if pd.notna(last_fecha) and pd.notna(last_id):
-                    st.session_state[f"cursor_{nombre_tabla}"] = (last_fecha, int(last_id))
             st.rerun()
 
     # Manejo de la tabla interactiva
     if nombre_tabla in ["insumos", "gastos"]:
-        # Se elimina "TIPO" de la lista de columnas editables
         columnas_editables = ["FECHA", "FORMA PAGO", "UNIDAD", "COSTO", "MARCA", "RECURRENCIA"]
         todas_las_columnas = df_pagina.columns.tolist()
         columnas_deshabilitadas = [c for c in todas_las_columnas if c not in columnas_editables]
@@ -337,9 +328,9 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
             "ID": None,
             "FECHA": st.column_config.DateColumn("FECHA", format="YYYY-MM-DD", width="small"),
             "FORMA PAGO": st.column_config.SelectboxColumn("FORMA PAGO", options=["EFECTIVO", "TARJETA", "TRANSFERENCIA"]),
-            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%.2f", step=0.01),
-            "COSTO": st.column_config.NumberColumn("COSTO", format="$%.2f", step=0.01),
-            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.2f", step=0.01),
+            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%g", step=1e-6),
+            "COSTO": st.column_config.NumberColumn("COSTO", format="$%g", step=1e-6),
+            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%g", step=1e-6),
             "MARCA": st.column_config.SelectboxColumn("MARCA", options=marcas_opciones),
             "RECURRENCIA": st.column_config.SelectboxColumn("RECURRENCIA", options=recurrencias_opciones)
         })
@@ -352,17 +343,14 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
             try:
                 idx = int(row_idx)
                 
-                # 1. Obtener valores editados o caer en los originales si no se editaron
                 val_u = cols_changed.get("UNIDAD", df_pagina.iloc[idx].get("UNIDAD", 0))
                 val_c = cols_changed.get("COSTO", df_pagina.iloc[idx].get("COSTO", 0))
                 
                 u = Decimal(str(val_u)) if pd.notna(val_u) else Decimal("0")
                 c = Decimal(str(val_c)) if pd.notna(val_c) else Decimal("0")
                 
-                # 2. Calcular el total tal como lo hará el backend
                 t = u * c
 
-                # 3. Revisar si alguna de las 3 variables resultó en 0
                 for nombre_campo, valor_campo in [("UNIDAD", u), ("COSTO", c), ("TOTAL", t)]:
                     if valor_campo == Decimal("0"):
                         row_id = df_pagina.iloc[idx].get("ID", f"índice {row_idx}")
@@ -378,7 +366,6 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
             st.session_state[estado_guardando] = False
 
         if filas_invalidas:
-            # Mensaje amigable y claro
             st.error("No se pueden guardar correcciones con valores en 0 en UNIDAD, COSTO o TOTAL. Corrige las siguientes filas antes de guardar:")
             for msg in filas_invalidas:
                 st.caption(f"• {msg}")
@@ -394,7 +381,6 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
                         guardar_correcciones_db_batch(nombre_tabla, cambios_detectados, df_pagina)
                         st.success("✅ Correcciones guardadas correctamente.")
                 except ValueError as ve:
-                    # Mensaje amigable si la validación del servidor falla
                     logger.exception("Validación fallida al guardar correcciones")
                     st.error(f"❌ No se guardaron las correcciones: {ve}")
                 except Exception as e:
@@ -411,8 +397,8 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
         st.dataframe(df_pagina, use_container_width=True, hide_index=True, column_config={
             "ID": None,
             "FECHA": st.column_config.DateColumn("FECHA", format="YYYY-MM-DD", width="small"),
-            "Cantidad": st.column_config.NumberColumn("Cantidad", format="%.2f"),
-            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.2f")
+            "Cantidad": st.column_config.NumberColumn("Cantidad", format="%g"),
+            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%g")
         })
 
 def mostrar_pestana_resumen():
@@ -439,7 +425,7 @@ def mostrar_pestana_resumen():
     if st.session_state.get("firma_filtros_anterior") != firma_filtros:
         for t in ["ventas", "insumos", "gastos"]:
             st.session_state[f"pagina_{t}"] = 0
-            st.session_state.pop(f"cursor_{t}", None)
+            # Removemos el pop del estado cursor aquí ya que no lo utilizamos
         st.session_state.firma_filtros_anterior = firma_filtros
         
     data_resumen = obtener_resumen_usuario_rango_cached(usuario_conectado, fecha_inicio, fecha_fin, tipo_filtro_sel, marca_sel)
