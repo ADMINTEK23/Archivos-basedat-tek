@@ -328,9 +328,9 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
             "ID": None,
             "FECHA": st.column_config.DateColumn("FECHA", format="YYYY-MM-DD", width="small"),
             "FORMA PAGO": st.column_config.SelectboxColumn("FORMA PAGO", options=["EFECTIVO", "TARJETA", "TRANSFERENCIA"]),
-            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%g", step=1e-6),
-            "COSTO": st.column_config.NumberColumn("COSTO", format="$%g", step=1e-6),
-            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%g", step=1e-6),
+            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%.15g", step=1e-15),
+            "COSTO": st.column_config.NumberColumn("COSTO", format="$%.15g", step=1e-15),
+            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.15g", step=1e-15),
             "MARCA": st.column_config.SelectboxColumn("MARCA", options=marcas_opciones),
             "RECURRENCIA": st.column_config.SelectboxColumn("RECURRENCIA", options=recurrencias_opciones)
         })
@@ -397,8 +397,8 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
         st.dataframe(df_pagina, use_container_width=True, hide_index=True, column_config={
             "ID": None,
             "FECHA": st.column_config.DateColumn("FECHA", format="YYYY-MM-DD", width="small"),
-            "Cantidad": st.column_config.NumberColumn("Cantidad", format="%g"),
-            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%g")
+            "Cantidad": st.column_config.NumberColumn("Cantidad", format="%.15g"),
+            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.15g")
         })
 
 def mostrar_pestana_resumen():
