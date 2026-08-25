@@ -92,27 +92,82 @@ def obtener_recurrencias_activas() -> List[str]:
         return []
 
 @st.cache_data(ttl=300, show_spinner=False)
+def obtener_usuarios_activos() -> List[str]:
+    q = text('''
+        SELECT DISTINCT UPPER(TRIM("USUARIO")) FROM ventas WHERE "USUARIO" IS NOT NULL
+        UNION SELECT DISTINCT UPPER(TRIM("USUARIO")) FROM insumos WHERE "USUARIO" IS NOT NULL
+        UNION SELECT DISTINCT UPPER(TRIM("USUARIO")) FROM gastos WHERE "USUARIO" IS NOT NULL
+    ''')
+    try:
+        with ENGINE_GLOBAL.connect() as conn:
+            res = conn.execute(q).fetchall()
+            return sorted([r[0] for r in res if r[0]])
+    except SQLAlchemyError:
+        logger.exception("Error al obtener usuarios")
+        return []
+
+@st.cache_data(ttl=300, show_spinner=False)
+def obtener_ventas_por_sucursal(usuario: str, fecha_inicio: date, fecha_fin: date, tipo_filtro: str, marca_filtro: str) -> Dict[str, float]:
+    if tipo_filtro not in FILTRO_COLUMNAS:
+        return {}
+    
+    col_date_expr = FILTRO_COLUMNAS[tipo_filtro]
+    usuario_u = str(usuario).strip().upper()
+    marca_cond = ' AND UPPER("MARCA") = :m ' if marca_filtro != "TODAS LAS MARCAS" else ""
+    usuario_cond = ' AND "USUARIO" = :u ' if usuario_u != "TODOS" else ""
+    
+    params = {"f_ini": fecha_inicio, "f_fin": fecha_fin}
+    if usuario_u != "TODOS":
+        params["u"] = usuario_u
+    if marca_filtro != "TODAS LAS MARCAS":
+        params["m"] = marca_filtro
+
+    q = text(f'''
+        SELECT COALESCE("SUCURSAL", 'SIN SUCURSAL'), COALESCE(SUM("TOTAL"), 0)
+        FROM ventas
+        WHERE {col_date_expr} BETWEEN :f_ini AND :f_fin {usuario_cond} {marca_cond}
+        GROUP BY "SUCURSAL"
+        ORDER BY "SUCURSAL" ASC
+    ''')
+    
+    try:
+        with ENGINE_GLOBAL.connect() as conn:
+            rows = conn.execute(q, params).fetchall()
+            return {r[0]: float(r[1]) for r in rows}
+    except SQLAlchemyError:
+        logger.exception("Error al obtener ventas por sucursal")
+        return {}
+
+@st.cache_data(ttl=300, show_spinner=False)
 def obtener_resumen_usuario_rango_cached(usuario: str, fecha_inicio: date, fecha_fin: date, tipo_filtro: str, marca_filtro: str) -> Dict[str, Any]:
     usuario_u = str(usuario).strip().upper()
     if tipo_filtro not in FILTRO_COLUMNAS:
         raise ValueError("Filtro no válido")
     col_date_expr = FILTRO_COLUMNAS[tipo_filtro]
+    
     marca_cond = ""
-    params = {"u": usuario_u, "f_ini": fecha_inicio, "f_fin": fecha_fin}
+    usuario_cond = ""
+    params = {"f_ini": fecha_inicio, "f_fin": fecha_fin}
+    
+    if usuario_u != "TODOS":
+        usuario_cond = ' AND "USUARIO" = :u '
+        params["u"] = usuario_u
+        
     if marca_filtro != "TODAS LAS MARCAS":
         marca_cond = ' AND UPPER("MARCA") = :m '
         params["m"] = marca_filtro
+        
     q = text(f"""
         SELECT concepto, forma_pago, COALESCE(SUM(total),0) AS total, COUNT(*) AS cnt
         FROM (
           SELECT 'ventas' AS concepto, "TOTAL"::numeric AS total, NULL AS forma_pago, {col_date_expr} AS fecha, "USUARIO", "MARCA" AS marca_campo
-            FROM ventas WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin {marca_cond}
+            FROM ventas WHERE {col_date_expr} BETWEEN :f_ini AND :f_fin {usuario_cond} {marca_cond}
           UNION ALL
           SELECT 'insumos', "TOTAL"::numeric, UPPER("FORMA PAGO"), {col_date_expr}, "USUARIO", "MARCA"
-            FROM insumos WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin {marca_cond}
+            FROM insumos WHERE {col_date_expr} BETWEEN :f_ini AND :f_fin {usuario_cond} {marca_cond}
           UNION ALL
           SELECT 'gastos', "TOTAL"::numeric, UPPER("FORMA PAGO"), {col_date_expr}, "USUARIO", "MARCA"
-            FROM gastos WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin {marca_cond}
+            FROM gastos WHERE {col_date_expr} BETWEEN :f_ini AND :f_fin {usuario_cond} {marca_cond}
         ) t
         GROUP BY concepto, forma_pago
     """)
@@ -137,34 +192,43 @@ def obtener_resumen_usuario_rango_cached(usuario: str, fecha_inicio: date, fecha
 def _clear_caches():
     try:
         obtener_marcas_activas.clear()
-    except Exception:
-        pass
-    try:
         obtener_recurrencias_activas.clear()
-    except Exception:
-        pass
-    try:
+        obtener_usuarios_activos.clear()
+        obtener_ventas_por_sucursal.clear()
         obtener_resumen_usuario_rango_cached.clear()
     except Exception:
         pass
 
-# --- Fetch con paginación (OFFSET sin cursor para evitar duplicidad) ---
-def fetch_page(table: str, select_cols: List[str], usuario: str, col_date_expr: str, fecha_inicio: date, fecha_fin: date, marca_filtro: str, limit: int = 100, offset: int = 0) -> pd.DataFrame:
+# --- Fetch con paginación (OFFSET o cursor) ---
+def fetch_page(table: str, select_cols: List[str], usuario: str, col_date_expr: str, fecha_inicio: date, fecha_fin: date, marca_filtro: str, limit: int = 50, offset: int = 0, cursor: Optional[Tuple[Optional[date], Optional[int]]] = None) -> pd.DataFrame:
     t = validar_tabla(table)
     cols_allowed = columnas_permitidas_para_tabla(t)
     select_cols_upper = [c.upper() for c in select_cols]
     for c in select_cols_upper:
         if c not in cols_allowed:
             raise ValueError(f"Columna no permitida: {c}")
+            
+    usuario_u = str(usuario).strip().upper()
     condicion_marca = ""
-    params = {"u": str(usuario).strip().upper(), "f_ini": fecha_inicio, "f_fin": fecha_fin, "limit": limit, "offset": offset}
+    condicion_usuario = ""
+    params = {"f_ini": fecha_inicio, "f_fin": fecha_fin, "limit": limit, "offset": offset}
+    
+    if usuario_u != "TODOS":
+        condicion_usuario = ' AND "USUARIO" = :u '
+        params["u"] = usuario_u
+        
     if marca_filtro != "TODAS LAS MARCAS":
         condicion_marca = ' AND UPPER("MARCA") = :m '
         params["m"] = marca_filtro
+        
     cols_sql = ", ".join([f'"{c}"' for c in select_cols])
     
-    # Se eliminó la validación del cursor para permitir una paginación exacta usando LIMIT y OFFSET
-    q = text(f'SELECT {cols_sql} FROM {t} WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin {condicion_marca} ORDER BY "FECHA" DESC, id DESC LIMIT :limit OFFSET :offset')
+    if cursor and cursor[0] is not None and cursor[1] is not None:
+        params.update({"last_fecha": cursor[0], "last_id": cursor[1]})
+        q = text(f'SELECT {cols_sql} FROM {t} WHERE {col_date_expr} BETWEEN :f_ini AND :f_fin {condicion_usuario} {condicion_marca} AND ( "FECHA" < :last_fecha OR ( "FECHA" = :last_fecha AND id < :last_id ) ) ORDER BY "FECHA" DESC, id DESC LIMIT :limit')
+    else:
+        q = text(f'SELECT {cols_sql} FROM {t} WHERE {col_date_expr} BETWEEN :f_ini AND :f_fin {condicion_usuario} {condicion_marca} ORDER BY "FECHA" DESC LIMIT :limit OFFSET :offset')
+        
     try:
         with ENGINE_GLOBAL.connect() as conn:
             df = pd.read_sql(q, conn, params=params)
@@ -286,7 +350,7 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
         st.caption(f"No se encontraron registros de {nombre_tabla.upper()} para este periodo y marca.")
         return
         
-    PAGE_SIZE = 100
+    PAGE_SIZE = 50
     estado_key = f"pagina_{nombre_tabla}"
     st.session_state.setdefault(estado_key, 0)
     pagina_actual = st.session_state[estado_key]
@@ -295,15 +359,16 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
     # Preparar parámetros para la extracción
     offset_actual = pagina_actual * PAGE_SIZE
     columnas_sql = meta[nombre_tabla]["cols"]
+    cursor_state = st.session_state.get(f"cursor_{nombre_tabla}", None)
     
-    # Solicitud limpia basada solo en offset y limit
-    df_pagina = fetch_page(table=nombre_tabla, select_cols=columnas_sql, usuario=usuario_conectado, col_date_expr=col_date_expr, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin, marca_filtro=marca_filtro, limit=PAGE_SIZE, offset=offset_actual)
+    df_pagina = fetch_page(table=nombre_tabla, select_cols=columnas_sql, usuario=usuario_conectado, col_date_expr=col_date_expr, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin, marca_filtro=marca_filtro, limit=PAGE_SIZE, offset=offset_actual, cursor=cursor_state)
     
     col_izq, col_centro, col_der = st.columns([1, 2, 1])
     
     with col_izq:
         if st.button("⬅️ Anterior", key=f"prev_{nombre_tabla}", disabled=(pagina_actual <= 0)):
             st.session_state[estado_key] = max(0, pagina_actual - 1)
+            st.session_state.pop(f"cursor_{nombre_tabla}", None)
             st.rerun()
             
     with col_centro:
@@ -312,10 +377,16 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
     with col_der:
         if st.button("Siguiente ➡️", key=f"next_{nombre_tabla}", disabled=((pagina_actual + 1) >= total_paginas)):
             st.session_state[estado_key] = min(total_paginas - 1, pagina_actual + 1)
+            if not df_pagina.empty:
+                last_fecha = df_pagina.iloc[-1].get("FECHA")
+                last_id = df_pagina.iloc[-1].get("ID")
+                if pd.notna(last_fecha) and pd.notna(last_id):
+                    st.session_state[f"cursor_{nombre_tabla}"] = (last_fecha, int(last_id))
             st.rerun()
 
     # Manejo de la tabla interactiva
     if nombre_tabla in ["insumos", "gastos"]:
+        # Se elimina "TIPO" de la lista de columnas editables
         columnas_editables = ["FECHA", "FORMA PAGO", "UNIDAD", "COSTO", "MARCA", "RECURRENCIA"]
         todas_las_columnas = df_pagina.columns.tolist()
         columnas_deshabilitadas = [c for c in todas_las_columnas if c not in columnas_editables]
@@ -328,9 +399,9 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
             "ID": None,
             "FECHA": st.column_config.DateColumn("FECHA", format="YYYY-MM-DD", width="small"),
             "FORMA PAGO": st.column_config.SelectboxColumn("FORMA PAGO", options=["EFECTIVO", "TARJETA", "TRANSFERENCIA"]),
-            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%.15g", step=1e-15),
-            "COSTO": st.column_config.NumberColumn("COSTO", format="$%.15g", step=1e-15),
-            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.15g", step=1e-15),
+            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%.2f", step=0.01),
+            "COSTO": st.column_config.NumberColumn("COSTO", format="$%.2f", step=0.01),
+            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.2f", step=0.01),
             "MARCA": st.column_config.SelectboxColumn("MARCA", options=marcas_opciones),
             "RECURRENCIA": st.column_config.SelectboxColumn("RECURRENCIA", options=recurrencias_opciones)
         })
@@ -343,14 +414,17 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
             try:
                 idx = int(row_idx)
                 
+                # 1. Obtener valores editados o caer en los originales si no se editaron
                 val_u = cols_changed.get("UNIDAD", df_pagina.iloc[idx].get("UNIDAD", 0))
                 val_c = cols_changed.get("COSTO", df_pagina.iloc[idx].get("COSTO", 0))
                 
                 u = Decimal(str(val_u)) if pd.notna(val_u) else Decimal("0")
                 c = Decimal(str(val_c)) if pd.notna(val_c) else Decimal("0")
                 
+                # 2. Calcular el total tal como lo hará el backend
                 t = u * c
 
+                # 3. Revisar si alguna de las 3 variables resultó en 0
                 for nombre_campo, valor_campo in [("UNIDAD", u), ("COSTO", c), ("TOTAL", t)]:
                     if valor_campo == Decimal("0"):
                         row_id = df_pagina.iloc[idx].get("ID", f"índice {row_idx}")
@@ -366,6 +440,7 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
             st.session_state[estado_guardando] = False
 
         if filas_invalidas:
+            # Mensaje amigable y claro
             st.error("No se pueden guardar correcciones con valores en 0 en UNIDAD, COSTO o TOTAL. Corrige las siguientes filas antes de guardar:")
             for msg in filas_invalidas:
                 st.caption(f"• {msg}")
@@ -381,6 +456,7 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
                         guardar_correcciones_db_batch(nombre_tabla, cambios_detectados, df_pagina)
                         st.success("✅ Correcciones guardadas correctamente.")
                 except ValueError as ve:
+                    # Mensaje amigable si la validación del servidor falla
                     logger.exception("Validación fallida al guardar correcciones")
                     st.error(f"❌ No se guardaron las correcciones: {ve}")
                 except Exception as e:
@@ -397,21 +473,33 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
         st.dataframe(df_pagina, use_container_width=True, hide_index=True, column_config={
             "ID": None,
             "FECHA": st.column_config.DateColumn("FECHA", format="YYYY-MM-DD", width="small"),
-            "Cantidad": st.column_config.NumberColumn("Cantidad", format="%.15g"),
-            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.15g")
+            "Cantidad": st.column_config.NumberColumn("Cantidad", format="%.2f"),
+            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.2f")
         })
 
 def mostrar_pestana_resumen():
     st.header("📋 Resumen Diario de Capturas")
-    usuario_conectado = str(st.session_state.get("usuario_actual", "ANÓNIMO")).strip().upper()
-    st.info(f"👤 Mostrando actividad del usuario: **{usuario_conectado}**")
+    
+    usuario_actual = str(st.session_state.get("usuario_actual", "ANÓNIMO")).strip().upper()
+    es_admin = st.session_state.get("es_admin", False)
+    
+    if es_admin:
+        usuarios_db = obtener_usuarios_activos()
+        opciones_usuarios = ["TODOS"] + usuarios_db
+        idx_defecto = opciones_usuarios.index(usuario_actual) if usuario_actual in opciones_usuarios else 0
+        
+        st.info("👑 Modo Administrador:")
+        usuario_conectado = st.selectbox("👤 Visualizar actividad del usuario:", opciones_usuarios, index=idx_defecto)
+    else:
+        usuario_conectado = usuario_actual
+        st.info(f"👤 Mostrando actividad del usuario: **{usuario_conectado}**")
     
     col_filtro1, col_filtro2, col_filtro3 = st.columns(3)
     with col_filtro1:
         tipo_filtro_sel = st.selectbox("1. Criterio de búsqueda:", ["Fecha Captura", "Fecha Sistema"])
     with col_filtro2:
-        fecha_actual = datetime.now().date()
-        fechas_seleccionadas = st.date_input("2. Selecciona Rango de Fechas:", value=(fecha_actual, fecha_actual))
+        fecha_actual_dia = datetime.now().date()
+        fechas_seleccionadas = st.date_input("2. Selecciona Rango de Fechas:", value=(fecha_actual_dia, fecha_actual_dia))
     with col_filtro3:
         lista_marcas_db = obtener_marcas_activas()
         marca_sel = st.selectbox("3. Selecciona Marca:", lista_marcas_db)
@@ -421,11 +509,11 @@ def mostrar_pestana_resumen():
     else:
         fecha_inicio = fecha_fin = fechas_seleccionadas[0] if isinstance(fechas_seleccionadas, tuple) else fechas_seleccionadas
         
-    firma_filtros = f"{fecha_inicio}_{fecha_fin}_{tipo_filtro_sel}_{marca_sel}"
+    firma_filtros = f"{fecha_inicio}_{fecha_fin}_{tipo_filtro_sel}_{marca_sel}_{usuario_conectado}"
     if st.session_state.get("firma_filtros_anterior") != firma_filtros:
         for t in ["ventas", "insumos", "gastos"]:
             st.session_state[f"pagina_{t}"] = 0
-            # Removemos el pop del estado cursor aquí ya que no lo utilizamos
+            st.session_state.pop(f"cursor_{t}", None)
         st.session_state.firma_filtros_anterior = firma_filtros
         
     data_resumen = obtener_resumen_usuario_rango_cached(usuario_conectado, fecha_inicio, fecha_fin, tipo_filtro_sel, marca_sel)
@@ -449,11 +537,18 @@ def mostrar_pestana_resumen():
             with st.expander("Filtrar producto específico"):
                 col_date_expr = FILTRO_COLUMNAS[tipo_filtro_sel]
                 condicion_marca_prod = ""
-                params_prod = {"u": usuario_conectado, "f_ini": fecha_inicio, "f_fin": fecha_fin}
+                condicion_usuario_prod = ""
+                params_prod = {"f_ini": fecha_inicio, "f_fin": fecha_fin}
+                
+                if usuario_conectado != "TODOS":
+                    condicion_usuario_prod = ' AND "USUARIO" = :u '
+                    params_prod["u"] = usuario_conectado
+                    
                 if marca_sel != "TODAS LAS MARCAS":
                     condicion_marca_prod = ' AND UPPER("MARCA") = :m '
                     params_prod["m"] = marca_sel
-                q_prods = text(f'SELECT DISTINCT "Producto" FROM ventas WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin {condicion_marca_prod} ORDER BY "Producto" ASC')
+                    
+                q_prods = text(f'SELECT DISTINCT "Producto" FROM ventas WHERE {col_date_expr} BETWEEN :f_ini AND :f_fin {condicion_usuario_prod} {condicion_marca_prod} ORDER BY "Producto" ASC')
                 try:
                     with ENGINE_GLOBAL.connect() as conn:
                         df_prods = pd.read_sql(q_prods, conn, params=params_prod)
@@ -461,10 +556,11 @@ def mostrar_pestana_resumen():
                 except SQLAlchemyError:
                     logger.exception("Error obteniendo productos")
                     lista_productos = []
+                    
                 if lista_productos:
                     prod_seleccionado = st.selectbox("Selecciona Producto:", lista_productos, key="sb_filtro_prod_ventas")
                     params_prod["prod"] = prod_seleccionado
-                    q_det_prod = text(f'SELECT COALESCE(SUM("Cantidad"),0) as total_cant, COALESCE(SUM("TOTAL"),0) as total_monto FROM ventas WHERE "USUARIO" = :u AND {col_date_expr} BETWEEN :f_ini AND :f_fin AND "Producto" = :prod {condicion_marca_prod}')
+                    q_det_prod = text(f'SELECT COALESCE(SUM("Cantidad"),0) as total_cant, COALESCE(SUM("TOTAL"),0) as total_monto FROM ventas WHERE {col_date_expr} BETWEEN :f_ini AND :f_fin AND "Producto" = :prod {condicion_usuario_prod} {condicion_marca_prod}')
                     with ENGINE_GLOBAL.connect() as conn:
                         res_prod = conn.execute(q_det_prod, params_prod).fetchone()
                     cant_prod = float(res_prod[0]) if res_prod else 0.0
@@ -473,6 +569,18 @@ def mostrar_pestana_resumen():
                     st.markdown(f"💵 Total general: **${monto_prod:,.2f}**")
                 else:
                     st.caption("No hay productos registrados en este rango/marca.")
+            
+            # --- NUEVO BLOQUE: Desglose por Sucursal ---
+            st.markdown("<br>**Desglose por Sucursal:**", unsafe_allow_html=True)
+            ventas_sucursal = obtener_ventas_por_sucursal(
+                usuario_conectado, fecha_inicio, fecha_fin, tipo_filtro_sel, marca_sel
+            )
+            
+            if ventas_sucursal:
+                for suc, tot in ventas_sucursal.items():
+                    st.caption(f"🏬 {suc}: **${tot:,.2f}**")
+            else:
+                st.caption("No hay datos de sucursales en este periodo.")
                     
     for col, categoria in zip([col_sub_i, col_sub_g], ["insumos", "gastos"]):
         with col:

@@ -52,7 +52,8 @@ def ejecutar_login():
             "autenticado": False,
             "usuario_actual": "",
             "rol_actual": "",
-            "permisos_actuales": []
+            "permisos_actuales": [],
+            "es_admin": False  # <-- NUEVO: Inicializamos la variable es_admin
         })
 
     if not st.session_state["autenticado"]:
@@ -70,7 +71,8 @@ def ejecutar_login():
                         "autenticado": True,
                         "usuario_actual": usuario_input,
                         "rol_actual": rol_usuario,
-                        "permisos_actuales": PERMISOS.get(rol_usuario, ["ver"])
+                        "permisos_actuales": PERMISOS.get(rol_usuario, ["ver"]),
+                        "es_admin": rol_usuario == "admin"  # <-- NUEVO: Guardamos True si es admin, False si es otro rol
                     })
                     st.rerun()
                 else:
@@ -80,7 +82,7 @@ def ejecutar_login():
     # Barra lateral informativa de cierre de sesión
     st.sidebar.markdown(f"👤 *Usuario:* {st.session_state['usuario_actual']} ({st.session_state['rol_actual'].upper()})")
     if st.sidebar.button("Cerrar Sesión"):
-        # 4. LIMPIEZA EFICIENTE: Eliminamos las llaves en lugar de vaciarlas, previniendo errores de estado residual
-        for key in ["autenticado", "usuario_actual", "rol_actual", "permisos_actuales"]:
+        # 4. LIMPIEZA EFICIENTE: Agregamos "es_admin" a la lista para limpiarlo al cerrar sesión
+        for key in ["autenticado", "usuario_actual", "rol_actual", "permisos_actuales", "es_admin"]:
             st.session_state.pop(key, None)
         st.rerun()
