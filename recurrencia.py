@@ -3,12 +3,9 @@ import os
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-
 import pandas as pd
 import streamlit as st
-from sqlalchemy import text
-
-# Importamos el motor de base de datos desde tu db_utils (asegúrate de que ENGINE_GLOBAL esté expuesto)
+from sqlalchemy import text, bindparam
 from db_utils import ENGINE_GLOBAL
 
 # -------------------------
@@ -33,7 +30,6 @@ MESES_INV = {v: k for k, v in MESES_MAP.items()}
 # Helpers de Fecha
 # -------------------------
 def meses_anteriores(fecha_hasta: datetime, n: int) -> List[Dict[str, Any]]:
-    """Devuelve lista cronológica de n meses hasta fecha_hasta para etiquetas UI."""
     meses = []
     base = datetime(fecha_hasta.year, fecha_hasta.month, 1)
     for i in range(n - 1, -1, -1):
@@ -45,43 +41,65 @@ def meses_anteriores(fecha_hasta: datetime, n: int) -> List[Dict[str, Any]]:
         })
     return meses
 
+# -------------------------
+# Helpers de MARCAS
+# -------------------------
+@st.cache_data(ttl=600)
+def obtener_marcas_disponibles() -> List[str]:
+    q = text('SELECT DISTINCT "MARCA" FROM (SELECT "MARCA" FROM insumos UNION ALL SELECT "MARCA" FROM gastos) t WHERE "MARCA" IS NOT NULL')
+    try:
+        with ENGINE_GLOBAL.connect() as conn:
+            df = pd.read_sql(q, conn)
+        marcas = sorted([str(m).strip() for m in df["MARCA"].dropna().unique()])
+        return marcas
+    except Exception as e:
+        logger.error(f"Error obteniendo marcas: {e}")
+        return []
+
 # =====================================================================
 # 1. MODO AGGREGATE: Consultas SQL que devuelven resúmenes (CON CACHÉ)
 # =====================================================================
 @st.cache_data(ttl=300)
-def obtener_resumen_agregado(fecha_inicio: datetime, fecha_fin: datetime, origen: str) -> pd.DataFrame:
-    """Modo aggregate: SUM(TOTAL) por PROVEEDOR y AÑO_MES directamente desde la BD."""
+def obtener_resumen_agregado(fecha_inicio: datetime, fecha_fin: datetime, origen: str, marcas: Optional[List[str]] = None) -> pd.DataFrame:
     
-    query_insumos = """
+    base_insumos = """
         SELECT 'INSUMO' AS "ORIGEN", "PROVEEDOR", TO_CHAR("FECHA", 'YYYY-MM') AS "AÑO_MES_ISO", 
                SUM("TOTAL") AS "TOTAL"
         FROM insumos
         WHERE "FECHA" BETWEEN :inicio AND :fin
-        GROUP BY "PROVEEDOR", TO_CHAR("FECHA", 'YYYY-MM')
     """
     
-    query_gastos = """
+    base_gastos = """
         SELECT 'GASTO' AS "ORIGEN", "PROVEEDOR", TO_CHAR("FECHA", 'YYYY-MM') AS "AÑO_MES_ISO", 
                SUM("TOTAL") AS "TOTAL"
         FROM gastos
         WHERE "FECHA" BETWEEN :inicio AND :fin
-        GROUP BY "PROVEEDOR", TO_CHAR("FECHA", 'YYYY-MM')
     """
     
+    marca_clause = ""
+    if marcas:
+        marca_clause = ' AND "MARCA" IN :marcas '
+    
     queries = []
-    if origen in [TIPO_AMBOS, TIPO_INSUMOS]: queries.append(query_insumos)
-    if origen in [TIPO_AMBOS, TIPO_GASTOS]: queries.append(query_gastos)
+    if origen in [TIPO_AMBOS, TIPO_INSUMOS]:
+        queries.append(base_insumos + marca_clause + " GROUP BY \"PROVEEDOR\", TO_CHAR(\"FECHA\", 'YYYY-MM')")
+    if origen in [TIPO_AMBOS, TIPO_GASTOS]:
+        queries.append(base_gastos + marca_clause + " GROUP BY \"PROVEEDOR\", TO_CHAR(\"FECHA\", 'YYYY-MM')")
     
     final_query = " UNION ALL ".join(queries)
     
     try:
         with ENGINE_GLOBAL.connect() as conn:
-            df = pd.read_sql(text(final_query), conn, params={
+            stmt = text(final_query)
+            params = {
                 "inicio": fecha_inicio.strftime('%Y-%m-%d'),
                 "fin": fecha_fin.strftime('%Y-%m-%d')
-            })
+            }
+            if marcas:
+                stmt = stmt.bindparams(bindparam("marcas", expanding=True))
+                params["marcas"] = marcas
+            df = pd.read_sql(stmt, conn, params=params)
         
-        # Mapear ISO a etiqueta local para UI
         df[COL_ANIO_MES] = df["AÑO_MES_ISO"].apply(
             lambda x: f"{x.split('-')[0]} - {MESES_INV[int(x.split('-')[1])]}" if pd.notna(x) else pd.NA
         )
@@ -91,29 +109,40 @@ def obtener_resumen_agregado(fecha_inicio: datetime, fecha_fin: datetime, origen
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
-def obtener_metricas_agregadas(fecha_inicio: datetime, fecha_fin: datetime, origen: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Obtiene agregados para Costo Unitario, Categorías y Formas de Pago."""
+def obtener_metricas_agregadas(fecha_inicio: datetime, fecha_fin: datetime, origen: str, marcas: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     
-    # 1. Concentración Categoría y Forma de Pago (Solo Sumas)
-    q_cat = text("""
+    marca_clause = ""
+    if marcas:
+        marca_clause = ' AND "MARCA" IN :marcas '
+    
+    q_cat = text(f"""
         SELECT "CATEGORÍA", SUM("TOTAL") AS "TOTAL" FROM gastos 
-        WHERE "FECHA" BETWEEN :inicio AND :fin AND "CATEGORÍA" IS NOT NULL GROUP BY "CATEGORÍA"
+        WHERE "FECHA" BETWEEN :inicio AND :fin AND "CATEGORÍA" IS NOT NULL {marca_clause} GROUP BY "CATEGORÍA"
     """)
-    q_fp_insumos = text("""
+    q_fp_insumos = text(f"""
         SELECT "FORMA PAGO", SUM("TOTAL") AS "TOTAL" FROM insumos 
-        WHERE "FECHA" BETWEEN :inicio AND :fin AND "FORMA PAGO" IS NOT NULL GROUP BY "FORMA PAGO"
+        WHERE "FECHA" BETWEEN :inicio AND :fin AND "FORMA PAGO" IS NOT NULL {marca_clause} GROUP BY "FORMA PAGO"
     """)
-    q_fp_gastos = text("""
+    q_fp_gastos = text(f"""
         SELECT "FORMA PAGO", SUM("TOTAL") AS "TOTAL" FROM gastos 
-        WHERE "FECHA" BETWEEN :inicio AND :fin AND "FORMA PAGO" IS NOT NULL GROUP BY "FORMA PAGO"
+        WHERE "FECHA" BETWEEN :inicio AND :fin AND "FORMA PAGO" IS NOT NULL {marca_clause} GROUP BY "FORMA PAGO"
     """)
     
-    with ENGINE_GLOBAL.connect() as conn:
-        p = {"inicio": fecha_inicio.strftime('%Y-%m-%d'), "fin": fecha_fin.strftime('%Y-%m-%d')}
-        df_cat = pd.read_sql(q_cat, conn, params=p)
-        df_fp_i = pd.read_sql(q_fp_insumos, conn, params=p) if origen in [TIPO_AMBOS, TIPO_INSUMOS] else pd.DataFrame()
-        df_fp_g = pd.read_sql(q_fp_gastos, conn, params=p) if origen in [TIPO_AMBOS, TIPO_GASTOS] else pd.DataFrame()
-        
+    try:
+        with ENGINE_GLOBAL.connect() as conn:
+            params = {"inicio": fecha_inicio.strftime('%Y-%m-%d'), "fin": fecha_fin.strftime('%Y-%m-%d')}
+            if marcas:
+                q_cat = q_cat.bindparams(bindparam("marcas", expanding=True))
+                q_fp_insumos = q_fp_insumos.bindparams(bindparam("marcas", expanding=True))
+                q_fp_gastos = q_fp_gastos.bindparams(bindparam("marcas", expanding=True))
+                params["marcas"] = marcas
+            df_cat = pd.read_sql(q_cat, conn, params=params)
+            df_fp_i = pd.read_sql(q_fp_insumos, conn, params=params) if origen in [TIPO_AMBOS, TIPO_INSUMOS] else pd.DataFrame()
+            df_fp_g = pd.read_sql(q_fp_gastos, conn, params=params) if origen in [TIPO_AMBOS, TIPO_GASTOS] else pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Error obteniendo métricas agregadas: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+    
     df_fp = pd.concat([df_fp_i, df_fp_g]).groupby("FORMA PAGO")["TOTAL"].sum().reset_index() if not (df_fp_i.empty and df_fp_g.empty) else pd.DataFrame()
     
     return df_cat, df_fp
@@ -122,8 +151,7 @@ def obtener_metricas_agregadas(fecha_inicio: datetime, fecha_fin: datetime, orig
 # 2. MODO DETAIL: Seek Cursor Paginado (SIN CACHÉ)
 # =====================================================================
 def obtener_detalle_proveedor_paginado(proveedor: str, fecha_inicio: datetime, fecha_fin: datetime, 
-                                       limit: int = 15, last_fecha: str = None, last_id: int = None) -> pd.DataFrame:
-    """Paginación eficiente usando cursores. Retorna columnas mínimas estrictas."""
+                                       limit: int = 15, last_fecha: str = None, last_id: int = None, marcas: Optional[List[str]] = None) -> pd.DataFrame:
     
     where_clauses = [
         '"PROVEEDOR" = :proveedor',
@@ -137,6 +165,10 @@ def obtener_detalle_proveedor_paginado(proveedor: str, fecha_inicio: datetime, f
         "limit": limit
     }
 
+    if marcas:
+        where_clauses.append('"MARCA" IN :marcas')
+        params["marcas"] = marcas
+
     if last_fecha and last_id:
         where_clauses.append('("FECHA" < :last_fecha OR ("FECHA" = :last_fecha AND id < :last_id))')
         params["last_fecha"] = last_fecha
@@ -144,19 +176,20 @@ def obtener_detalle_proveedor_paginado(proveedor: str, fecha_inicio: datetime, f
 
     str_where = " AND ".join(where_clauses)
     
-    # Columnas mínimas (sin SELECT *)
     q_insumos = f"""
         SELECT id, 'INSUMO' AS "ORIGEN", "FECHA", "PROVEEDOR", "INSUMO" AS "CONCEPTO", 
-               "FORMA PAGO", "TOTAL"
+               "FORMA PAGO", "MARCA", "TOTAL"
         FROM insumos WHERE {str_where}
     """
     q_gastos = f"""
         SELECT id, 'GASTO' AS "ORIGEN", "FECHA", "PROVEEDOR", "GASTO DE" AS "CONCEPTO", 
-               "FORMA PAGO", "TOTAL"
+               "FORMA PAGO", "MARCA", "TOTAL"
         FROM gastos WHERE {str_where}
     """
     
     final_query = text(f"({q_insumos}) UNION ALL ({q_gastos}) ORDER BY \"FECHA\" DESC, id DESC LIMIT :limit")
+    if marcas:
+        final_query = final_query.bindparams(bindparam("marcas", expanding=True))
 
     with ENGINE_GLOBAL.connect() as conn:
         df = pd.read_sql(final_query, conn, params=params, parse_dates=["FECHA"])
@@ -166,7 +199,6 @@ def obtener_detalle_proveedor_paginado(proveedor: str, fecha_inicio: datetime, f
 # 3. LÓGICA DE ANÁLISIS EN MEMORIA (Sobre datos pre-agregados)
 # =====================================================================
 def clasificacion_abc(df_agregado: pd.DataFrame) -> pd.DataFrame:
-    """Calcula ABC sobre el DataFrame que ya viene sumado desde SQL."""
     if df_agregado.empty: return pd.DataFrame()
     agg = df_agregado.groupby(COL_PROVEEDOR)[COL_TOTAL].sum().reset_index().sort_values(by=COL_TOTAL, ascending=False)
     agg['TOTAL_ACUM'] = agg[COL_TOTAL].cumsum()
@@ -179,7 +211,7 @@ def clasificacion_abc(df_agregado: pd.DataFrame) -> pd.DataFrame:
 # 4. INTERFAZ STREAMLIT
 # =====================================================================
 def mostrar_pestana_recurrencia():
-    st.title("🔄 Inteligencia de Pagos y Proveedores (Versión Optimizada)")
+    st.title("🔄 Pagos y Proveedores")
 
     # --- Inicializar cursores UI ---
     if "cursor_stack_prov" not in st.session_state:
@@ -195,6 +227,18 @@ def mostrar_pestana_recurrencia():
     meses_ventana = st.sidebar.selectbox("Meses a analizar", [3, 6, 12], index=1)
     tipo_modulo = st.sidebar.selectbox("Módulo", [TIPO_AMBOS, TIPO_GASTOS, TIPO_INSUMOS], index=0)
 
+    # --- Filtro global de MARCA (opción Todas) ---
+    marcas_disponibles = obtener_marcas_disponibles()
+    # Insertamos la opción especial "(Todas)" al inicio
+    opciones_marcas = ["(Todas)"] + marcas_disponibles
+    marcas_sel_ui = st.sidebar.multiselect("Filtrar por Marca", options=opciones_marcas, default=["(Todas)"])
+
+
+    if not marcas_sel_ui or "(Todas)" in marcas_sel_ui:
+        marcas_param = None
+    else:
+        marcas_param = marcas_sel_ui  # lista de marcas a filtrar
+
     # Calcular rango
     meses_meta = meses_anteriores(datetime(fecha_hasta.year, fecha_hasta.month, 1), meses_ventana)
     fecha_inicio = meses_meta[0]['fecha_inicio']
@@ -202,8 +246,8 @@ def mostrar_pestana_recurrencia():
 
     # --- Cargar datos agregados (Ligeros) ---
     with st.spinner("Consultando agregados desde la Base de Datos..."):
-        df_resumen = obtener_resumen_agregado(fecha_inicio, fecha_fin, tipo_modulo)
-        df_cat, df_fp = obtener_metricas_agregadas(fecha_inicio, fecha_fin, tipo_modulo)
+        df_resumen = obtener_resumen_agregado(fecha_inicio, fecha_fin, tipo_modulo, marcas=marcas_param)
+        df_cat, df_fp = obtener_metricas_agregadas(fecha_inicio, fecha_fin, tipo_modulo, marcas=marcas_param)
 
     if df_resumen.empty:
         st.warning("No se encontraron registros en el rango seleccionado.")
@@ -213,10 +257,10 @@ def mostrar_pestana_recurrencia():
     # 📑 PESTAÑAS DE VISUALIZACIÓN
     # ---------------------------------------------------------
     tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 Resumen y Evolución", 
-        "🥇 Análisis Pareto (ABC)", 
-        "🏦 Concentración de Gasto",
-        "🔍 Detalle (Paginado)"
+        "Resumen y Evolución", 
+        "Análisis Pareto", 
+        "Concentración de Gasto",
+        "Detalle"
     ])
 
     # --- TAB 1: Resumen General ---
@@ -253,12 +297,16 @@ def mostrar_pestana_recurrencia():
             if not df_cat.empty:
                 df_cat['PCT'] = df_cat["TOTAL"] / df_cat["TOTAL"].sum()
                 st.dataframe(df_cat.sort_values("TOTAL", ascending=False).style.format({"TOTAL": "${:,.2f}", 'PCT': "{:.1%}"}), hide_index=True)
+            else:
+                st.info("No hay datos de categorías para el filtro seleccionado.")
                 
         with colB:
             st.markdown("**Por Forma de Pago**")
             if not df_fp.empty:
                 df_fp['PCT'] = df_fp["TOTAL"] / df_fp["TOTAL"].sum()
                 st.dataframe(df_fp.sort_values("TOTAL", ascending=False).style.format({"TOTAL": "${:,.2f}", 'PCT': "{:.1%}"}), hide_index=True)
+            else:
+                st.info("No hay datos de formas de pago para el filtro seleccionado.")
 
     # --- TAB 4: Detalle Paginado (Seek Cursor) ---
     with tab4:
@@ -266,11 +314,11 @@ def mostrar_pestana_recurrencia():
         proveedores = sorted([str(p) for p in df_resumen[COL_PROVEEDOR].dropna().unique()])
         prov_sel = st.selectbox("Selecciona un proveedor:", ["(Ninguno)"] + proveedores)
         
-        # Resetear paginación si cambia el proveedor
-        if prov_sel != st.session_state.last_prov_searched:
+        if prov_sel != st.session_state.last_prov_searched or st.session_state.get("last_marcas_param") != marcas_param:
             st.session_state.cursor_stack_prov = []
             st.session_state.current_cursor_prov = (None, None)
             st.session_state.last_prov_searched = prov_sel
+            st.session_state.last_marcas_param = marcas_param
 
         if prov_sel and prov_sel != "(Ninguno)":
             limit = st.slider("Registros por página", 5, 50, 15)
@@ -278,7 +326,7 @@ def mostrar_pestana_recurrencia():
             
             df_pagina = obtener_detalle_proveedor_paginado(
                 proveedor=prov_sel, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin, 
-                limit=limit, last_fecha=cur_fecha, last_id=cur_id
+                limit=limit, last_fecha=cur_fecha, last_id=cur_id, marcas=marcas_param
             )
             
             st.dataframe(df_pagina.style.format({"TOTAL": "${:,.2f}"}), use_container_width=True, hide_index=True)
