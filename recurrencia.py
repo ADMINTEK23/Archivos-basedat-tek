@@ -223,21 +223,32 @@ def mostrar_pestana_recurrencia():
 
     # --- Controles en Sidebar ---
     st.sidebar.header("Filtros de Análisis")
+
+    # --- FILTRO GLOBAL DE MARCA (PREVIO Y OBLIGATORIO) ---
+    marcas_disponibles = obtener_marcas_disponibles()
+    opciones_marcas = ["TODAS"] + marcas_disponibles
+
+    # default=[] fuerza al usuario a elegir una opción antes de proceder
+    marcas_sel_ui = st.sidebar.multiselect(
+        "Filtrar por Marca", 
+        options=opciones_marcas, 
+        default=[],
+        help="Selecciona una o varias marcas."
+    )
+
+    # Validar filtro previo: Si no se ha elegido ninguna marca, detiene la ejecución
+    if not marcas_sel_ui:
+        st.info("👈 **Por favor, selecciona al menos una MARCA.**")
+        st.stop()
+
+    if "TODAS" in marcas_sel_ui:
+        marcas_param = None
+    else:
+        marcas_param = marcas_sel_ui  # Lista de marcas seleccionadas
+
     fecha_hasta = st.sidebar.date_input("Fecha de corte (hasta)", value=datetime.today())
     meses_ventana = st.sidebar.selectbox("Meses a analizar", [3, 6, 12], index=1)
     tipo_modulo = st.sidebar.selectbox("Módulo", [TIPO_AMBOS, TIPO_GASTOS, TIPO_INSUMOS], index=0)
-
-    # --- Filtro global de MARCA (opción Todas) ---
-    marcas_disponibles = obtener_marcas_disponibles()
-    # Insertamos la opción especial "(Todas)" al inicio
-    opciones_marcas = ["(Todas)"] + marcas_disponibles
-    marcas_sel_ui = st.sidebar.multiselect("Filtrar por Marca", options=opciones_marcas, default=["(Todas)"])
-
-
-    if not marcas_sel_ui or "(Todas)" in marcas_sel_ui:
-        marcas_param = None
-    else:
-        marcas_param = marcas_sel_ui  # lista de marcas a filtrar
 
     # Calcular rango
     meses_meta = meses_anteriores(datetime(fecha_hasta.year, fecha_hasta.month, 1), meses_ventana)
@@ -250,7 +261,7 @@ def mostrar_pestana_recurrencia():
         df_cat, df_fp = obtener_metricas_agregadas(fecha_inicio, fecha_fin, tipo_modulo, marcas=marcas_param)
 
     if df_resumen.empty:
-        st.warning("No se encontraron registros en el rango seleccionado.")
+        st.warning("No se encontraron registros en el rango y marca(s) seleccionados.")
         return
 
     # ---------------------------------------------------------
