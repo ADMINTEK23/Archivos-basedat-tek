@@ -20,7 +20,8 @@ if st.session_state.get("autenticado", False):
             "📝 Capturar Transacciones", 
             "📋 Resumen de Capturas", 
             "✂️ Traspasos",
-            "👤 Auditoría de Usuarios"
+            "👤 Auditoría de Usuarios",
+            "🔄 Recurrencia"
         ]
     elif rol == "viewer":
         lista_opciones = ["📊 Gráficos y Reportes", "📋 Resumen de Capturas"]
@@ -50,5 +51,10 @@ if st.session_state.get("autenticado", False):
         # 💡 CORRECCIÓN: Ahora apunta al nuevo archivo auditoria.py
         elif vista_actual == "👤 Auditoría de Usuarios":
             importlib.import_module("auditoria").mostrar_pestana_auditoria_usuarios()
+
+        # Nuevo: Ahora apunta al nuevo archivo recurrencia.py
+        elif vista_actual == "🔄 Recurrencia":
+            importlib.import_module("recurrencia").mostrar_pestana_recurrencia()
+
 else:
     st.stop()

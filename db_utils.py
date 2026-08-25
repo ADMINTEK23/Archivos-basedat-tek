@@ -1,10 +1,9 @@
-import os
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
 
 # OBTENER URL DE LOS SECRETOS SEGUROS
-DATABASE_URL = os.getenv("DATABASE_URL") or st.secrets.get("DATABASE_URL")
+DATABASE_URL = st.secrets["database"]["url"]
 
 # 1. OPTIMIZACIÓN: Caching de recursos con verificación de estado activa
 @st.cache_resource
@@ -189,4 +188,56 @@ def cargar_catalogos_historicos(version_cache=0):
         return cat_ventas, cat_insumos, cat_gastos
     except Exception as e:
         st.error(f"Error cargando catálogos históricos: {e}")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+# =====================================================================
+# 📆 FUNCIÓN NUEVA: CONSULTA POR RANGO DE FECHAS (DASHBOARD RECURRENCIA)
+# =====================================================================
+from datetime import datetime
+
+@st.cache_data(ttl=28800)
+def cargar_datos_por_rango(fecha_inicio, fecha_fin, version_cache=0):
+    """
+    Consulta registros dentro de un rango de fechas exacto (inicio y fin).
+    Esencial para la ventana temporal dinámica de la herramienta de inteligencia.
+    """
+    # 1. Aseguramos que las fechas sean strings en formato YYYY-MM-DD para SQLAlchemy
+    if isinstance(fecha_inicio, datetime):
+        fecha_inicio = fecha_inicio.strftime('%Y-%m-%d')
+    if isinstance(fecha_fin, datetime):
+        fecha_fin = fecha_fin.strftime('%Y-%m-%d')
+
+    # 2. Consultas optimizadas con BETWEEN. 
+    # NOTA: Se agregaron "FORMA PAGO" y "CORREGIDO" a insumos y gastos.
+    query_ventas = text("""
+        SELECT id, "FECHA", "SUCURSAL", "MARCA", "TOTAL", "Producto", "Vendedor", "Cliente", "USUARIO", "FECHA_CAPTURA"
+        FROM ventas WHERE "FECHA" BETWEEN :inicio AND :fin
+    """)
+    query_insumos = text("""
+        SELECT id, "FECHA", "PROVEEDOR", "MARCA", "INSUMO", "TIPO", "COSTO", "UNIDAD", "TOTAL", "USUARIO", "FECHA_CAPTURA", "FORMA PAGO", "CORREGIDO"
+        FROM insumos WHERE "FECHA" BETWEEN :inicio AND :fin
+    """)
+    query_gastos = text("""
+        SELECT id, "FECHA", "CATEGORÍA", "PROVEEDOR", "MARCA", "GASTO DE", "TIPO", "RECURRENCIA", "COSTO", "UNIDAD", "TOTAL", "USUARIO", "FECHA_CAPTURA", "FORMA PAGO", "CORREGIDO"
+        FROM gastos WHERE "FECHA" BETWEEN :inicio AND :fin
+    """)
+    
+    try:
+        with ENGINE_GLOBAL.connect() as conn:
+            parametros = {"inicio": fecha_inicio, "fin": fecha_fin}
+            
+            # Ejecutamos las 3 consultas
+            ventas = pd.read_sql(query_ventas, conn, params=parametros, parse_dates=["FECHA"])
+            insumos = pd.read_sql(query_insumos, conn, params=parametros, parse_dates=["FECHA"])
+            gastos = pd.read_sql(query_gastos, conn, params=parametros, parse_dates=["FECHA"])
+        
+        # 3. Reutilizamos tu función de normalización existente
+        ventas = _normalizar_dataframe_financiero(ventas)
+        insumos = _normalizar_dataframe_financiero(insumos)
+        gastos = _normalizar_dataframe_financiero(gastos)
+                    
+        return ventas, insumos, gastos
+        
+    except Exception as e:
+        st.error(f"Error en consulta SQL por rango: {e}")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
