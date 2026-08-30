@@ -399,9 +399,9 @@ def renderizar_tabla_paginada(nombre_tabla: str, counts: Dict[str, int], meta: D
             "ID": None,
             "FECHA": st.column_config.DateColumn("FECHA", format="YYYY-MM-DD", width="small"),
             "FORMA PAGO": st.column_config.SelectboxColumn("FORMA PAGO", options=["EFECTIVO", "TARJETA", "TRANSFERENCIA"]),
-            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%.2f", step=1e-50),
-            "COSTO": st.column_config.NumberColumn("COSTO", format="$%.2f", step=1e-50),
-            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.2f", step=1e-50),
+            "UNIDAD": st.column_config.NumberColumn("UNIDAD", format="%.2f", step=1e-14),
+            "COSTO": st.column_config.NumberColumn("COSTO", format="$%.2f", step=1e-14),
+            "TOTAL": st.column_config.NumberColumn("TOTAL", format="$%.2f", step=1e-14),
             "MARCA": st.column_config.SelectboxColumn("MARCA", options=marcas_opciones),
             "RECURRENCIA": st.column_config.SelectboxColumn("RECURRENCIA", options=recurrencias_opciones)
         })
