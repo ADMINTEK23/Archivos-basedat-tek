@@ -9,22 +9,8 @@ import streamlit as st
 from sqlalchemy import text, bindparam
 from db_utils import ENGINE_GLOBAL  # Asegurar conexión vía PgBouncer/Supavisor (ej. puerto 6543)[span_0](start_span)[span_0](end_span)
 
-# Optional sklearn for anomaly detection[span_1](start_span)[span_1](end_span)
-try:
-    from sklearn.ensemble import IsolationForest
-    SKLEARN_AVAILABLE = True
-except Exception:
-    SKLEARN_AVAILABLE = False
-
-# Optional statsmodels for SARIMA forecasting
-try:
-    from statsmodels.tsa.statespace.sarimax import SARIMAX
-    STATSMODELS_AVAILABLE = True
-except Exception:
-    STATSMODELS_AVAILABLE = False
-
 # -------------------------
-# Config y constantes[span_2](start_span)[span_2](end_span)
+# Config y constantes[span_1](start_span)[span_1](end_span)
 # -------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,7 +28,7 @@ MESES_MAP = {'ENE': 1, 'FEB': 2, 'MAR': 3, 'ABR': 4, 'MAY': 5, 'JUN': 6,
 MESES_INV = {v: k for k, v in MESES_MAP.items()}
 
 # -------------------------
-# Helpers de Fecha[span_3](start_span)[span_3](end_span)
+# Helpers de Fecha[span_2](start_span)[span_2](end_span)
 # -------------------------
 def meses_anteriores(fecha_hasta: datetime, n: int) -> List[Dict[str, Any]]:
     meses = []
@@ -57,78 +43,7 @@ def meses_anteriores(fecha_hasta: datetime, n: int) -> List[Dict[str, Any]]:
     return meses
 
 # -------------------------
-# DB: índices, materialized view y tabla de auditoría[span_4](start_span)[span_4](end_span)
-# -------------------------
-def crear_indices_y_mv(run: bool = False):
-    sqls = [
-        "CREATE INDEX IF NOT EXISTS idx_insumos_fecha_id ON insumos (FECHA DESC, id DESC);",
-        "CREATE INDEX IF NOT EXISTS idx_gastos_fecha_id ON gastos (FECHA DESC, id DESC);",
-        "CREATE INDEX IF NOT EXISTS idx_insumos_marca ON insumos (MARCA);",
-        "CREATE INDEX IF NOT EXISTS idx_gastos_marca ON gastos (MARCA);",
-        "CREATE INDEX IF NOT EXISTS idx_insumos_proveedor ON insumos (PROVEEDOR);",
-        "CREATE INDEX IF NOT EXISTS idx_gastos_proveedor ON gastos (PROVEEDOR);",
-        """
-        CREATE TABLE IF NOT EXISTS admin_ops_log (
-            id BIGSERIAL PRIMARY KEY,
-            op_type TEXT NOT NULL,
-            details JSONB,
-            executed_by TEXT,
-            executed_at TIMESTAMP WITH TIME ZONE DEFAULT now()
-        );
-        """,
-        """
-        CREATE MATERIALIZED VIEW IF NOT EXISTS mv_resumen_mensual AS
-        SELECT origen, proveedor, date_trunc('month', fecha) AS mes, marca, "FORMA PAGO" AS forma_pago, SUM(total) AS total
-        FROM (
-            SELECT 'INSUMO'::text AS origen, PROVEEDOR, FECHA, MARCA, "FORMA PAGO", TOTAL FROM insumos
-            UNION ALL
-            SELECT 'GASTO'::text AS origen, PROVEEDOR, FECHA, MARCA, "FORMA PAGO", TOTAL FROM gastos
-        ) t
-        GROUP BY origen, proveedor, date_trunc('month', fecha), marca, "FORMA PAGO";
-        """,
-        "CREATE INDEX IF NOT EXISTS idx_mv_resumen_mes ON mv_resumen_mensual (mes);",
-        # Índice único requerido para REFRESH CONCURRENTLY
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_resumen_unique ON mv_resumen_mensual (origen, proveedor, mes, marca, forma_pago);"
-    ]
-    if not run:
-        return sqls
-
-    results = []
-    try:
-        with ENGINE_GLOBAL.connect() as conn:
-            for s in sqls:
-                conn.execute(text(s))
-                results.append(f"OK: {s.splitlines()[0][:80]}")
-        return results
-    except Exception as e:
-        logger.exception("Error creando índices/MV")
-        return [f"ERROR: {e}"]
-
-def refresh_materialized_views(run: bool = False, executed_by: Optional[str] = None):
-    sql_refresh = "REFRESH MATERIALIZED VIEW CONCURRENTLY mv_resumen_mensual;"
-    if not run:
-        return [sql_refresh]
-    try:
-        with ENGINE_GLOBAL.connect() as conn:
-            try:
-                conn.execute(text(sql_refresh))
-            except Exception as e:
-                logger.warning("Fallo en REFRESH CONCURRENTLY (puede estar vacía). Ejecutando refresh estándar: %s", e)
-                conn.execute(text("REFRESH MATERIALIZED VIEW mv_resumen_mensual;"))
-            
-            try:
-                conn.execute(text(
-                    "INSERT INTO admin_ops_log (op_type, details, executed_by) VALUES (:op, :details, :user)"
-                ), {"op": "REFRESH_MV", "details": {"mv": "mv_resumen_mensual"}, "user": executed_by})
-            except Exception:
-                logger.exception("No se pudo registrar admin_ops_log")
-        return ["OK: refreshed mv_resumen_mensual"]
-    except Exception as e:
-        logger.exception("Error refrescando materialized view")
-        return [f"ERROR: {e}"]
-
-# -------------------------
-# Helpers de MARCAS[span_5](start_span)[span_5](end_span)
+# Helpers de MARCAS[span_3](start_span)[span_3](end_span)
 # -------------------------
 @st.cache_data(ttl=600)
 def obtener_marcas_disponibles() -> List[str]:
@@ -143,7 +58,7 @@ def obtener_marcas_disponibles() -> List[str]:
         raise RuntimeError("Error al obtener marcas desde la base de datos: " + str(e))
 
 # =====================================================================
-# 1. MODO AGGREGATE: Consultas SQL que devuelven resúmenes[span_6](start_span)[span_6](end_span)
+# 1. MODO AGGREGATE: Consultas SQL que devuelven resúmenes[span_4](start_span)[span_4](end_span)
 # =====================================================================
 @st.cache_data(ttl=300)
 def obtener_resumen_agregado(fecha_inicio: datetime, fecha_fin: datetime, origen: str, marcas: Optional[List[str]] = None, _refresh: int = 0) -> pd.DataFrame:
@@ -235,7 +150,7 @@ def obtener_metricas_agregadas(fecha_inicio: datetime, fecha_fin: datetime, orig
     return df_cat, df_ins, df_fp_g, df_fp_i
 
 # =====================================================================
-# 2. MODO DETAIL: Seek Cursor Paginado[span_7](start_span)[span_7](end_span)
+# 2. MODO DETAIL: Seek Cursor Paginado[span_5](start_span)[span_5](end_span)
 # =====================================================================
 def obtener_detalle_proveedor_paginado(proveedor: str, fecha_inicio: datetime, fecha_fin: datetime, 
                                        limit: int = 15, last_fecha: str = None, last_id: int = None, marcas: Optional[List[str]] = None) -> Tuple[pd.DataFrame, bool]:
@@ -285,7 +200,7 @@ def obtener_detalle_proveedor_paginado(proveedor: str, fecha_inicio: datetime, f
     return df, has_more
 
 # =====================================================================
-# 3. LÓGICA DE ANÁLISIS EN MEMORIA[span_8](start_span)[span_8](end_span)
+# 3. LÓGICA DE ANÁLISIS EN MEMORIA[span_6](start_span)[span_6](end_span)
 # =====================================================================
 def clasificacion_abc(df_agregado: pd.DataFrame) -> pd.DataFrame:
     if df_agregado.empty: return pd.DataFrame()
@@ -309,103 +224,8 @@ def pareto_evolucion(df_resumen: pd.DataFrame, meses_meta: List[Dict[str, Any]])
         out.append(tmp[['mes', COL_PROVEEDOR, COL_TOTAL, 'pct', 'cum_pct']])
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
-@st.cache_data(ttl=600, show_spinner=False)
-def forecast_sarima(df_resumen: pd.DataFrame, periods: int = 3) -> pd.DataFrame:
-    if df_resumen.empty:
-        return pd.DataFrame()
-    df = df_resumen.copy()
-    df['mes_iso'] = df['AÑO_MES_ISO'].apply(lambda x: pd.to_datetime(x + "-01") if pd.notna(x) else pd.NaT)
-    series = df.groupby('mes_iso')[COL_TOTAL].sum().reset_index().sort_values('mes_iso')
-    
-    if series.shape[0] < 2:
-        return series.rename(columns={COL_TOTAL: 'total'}).assign(forecast=np.nan)
-    
-    series['x'] = np.arange(len(series))
-    future_x = np.arange(len(series), len(series) + periods)
-    future_dates = [series['mes_iso'].max() + relativedelta(months=i+1) for i in range(periods)]
-    
-    if STATSMODELS_AVAILABLE and len(series) >= 12:
-        try:
-            model = SARIMAX(series[COL_TOTAL].values, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12))
-            fit_model = model.fit(disp=False)
-            series['forecast'] = fit_model.fittedvalues
-            forecast_vals = fit_model.forecast(steps=periods)
-        except Exception as e:
-            logger.warning("SARIMA falló, usando regresión lineal: %s", e)
-            coef = np.polyfit(series['x'], series[COL_TOTAL], 1)
-            poly = np.poly1d(coef)
-            series['forecast'] = poly(series['x'])
-            forecast_vals = poly(future_x)
-    else:
-        coef = np.polyfit(series['x'], series[COL_TOTAL], 1)
-        poly = np.poly1d(coef)
-        series['forecast'] = poly(series['x'])
-        forecast_vals = poly(future_x)
-
-    df_future = pd.DataFrame({'mes_iso': future_dates, 'total': np.nan, 'forecast': forecast_vals})
-    series = series[['mes_iso', COL_TOTAL, 'forecast']].rename(columns={COL_TOTAL: 'total'})
-    return pd.concat([series, df_future], ignore_index=True)
-
-@st.cache_data(ttl=600)
-def obtener_stats_proveedor(fecha_inicio: datetime, fecha_fin: datetime, marcas: Optional[List[str]] = None) -> pd.DataFrame:
-    marca_clause = ""
-    if marcas:
-        marca_clause = ' AND "MARCA" IN :marcas '
-    q = text(f"""
-        SELECT proveedor AS "PROVEEDOR",
-               AVG(total) AS mean_total,
-               STDDEV_POP(total) AS std_total,
-               COUNT(*) AS n
-        FROM (
-            SELECT PROVEEDOR, TOTAL FROM insumos WHERE "FECHA" BETWEEN :inicio AND :fin {marca_clause}
-            UNION ALL
-            SELECT PROVEEDOR, TOTAL FROM gastos WHERE "FECHA" BETWEEN :inicio AND :fin {marca_clause}
-        ) t
-        GROUP BY proveedor
-    """)
-    try:
-        with ENGINE_GLOBAL.connect() as conn:
-            params = {"inicio": fecha_inicio.strftime('%Y-%m-%d'), "fin": fecha_fin.strftime('%Y-%m-%d')}
-            if marcas:
-                q = q.bindparams(bindparam("marcas", expanding=True))
-                params["marcas"] = marcas
-            df = pd.read_sql(q, conn)
-            return df
-    except Exception as e:
-        logger.exception("Error en obtener_stats_proveedor")
-        raise RuntimeError("Error al calcular estadísticas por proveedor: " + str(e))
-
-@st.cache_data(ttl=600, show_spinner=False)
-def aislar_anomalias_iforest(vals: np.ndarray) -> np.ndarray:
-    iso = IsolationForest(contamination=0.01, random_state=42)
-    preds = iso.fit_predict(vals)
-    return preds == -1
-
-def detectar_anomalias_con_stats(df_detalle: pd.DataFrame, stats_df: pd.DataFrame, z_thresh: float = 3.0) -> pd.DataFrame:
-    if df_detalle.empty:
-        return df_detalle
-    df = df_detalle.copy()
-    df['TOTAL_NUM'] = pd.to_numeric(df['TOTAL'], errors='coerce').fillna(0.0)
-    df = df.merge(stats_df, on='PROVEEDOR', how='left')
-    df['std_total'] = df['std_total'].replace({0: np.nan})
-    df['z'] = (df['TOTAL_NUM'] - df['mean_total']) / df['std_total']
-    df['anomaly_z'] = df['z'].abs() > z_thresh
-    
-    if SKLEARN_AVAILABLE:
-        try:
-            vals = df[['TOTAL_NUM']].fillna(0.0).values
-            df['anomaly_iforest'] = aislar_anomalias_iforest(vals)
-        except Exception as e:
-            logger.warning("IsolationForest falló: %s", e)
-            df['anomaly_iforest'] = False
-    else:
-        df['anomaly_iforest'] = False
-        
-    df['anomaly'] = df['anomaly_z'] | df['anomaly_iforest']
-    return df.drop(columns=['TOTAL_NUM', 'z', 'anomaly_z', 'anomaly_iforest'], errors='ignore')
-
 # =====================================================================
-# 4. INTERFAZ STREAMLIT[span_9](start_span)[span_9](end_span)
+# 4. INTERFAZ STREAMLIT[span_7](start_span)[span_7](end_span)
 # =====================================================================
 def render_tab_resumen(df_resumen: pd.DataFrame, meses_meta: List[Dict[str, Any]]):
     st.subheader("Resumen: Totales por Proveedor")
@@ -526,67 +346,8 @@ def render_tab_detalle(df_resumen: pd.DataFrame, fecha_inicio: datetime, fecha_f
         with b3:
             st.markdown(f"**Página:** {len(st.session_state.cursor_stack_prov) + 1}  —  **Hay más registros:** {'Sí' if has_more else 'No'}")
 
-def render_tab_analisis_avanzados(df_resumen: pd.DataFrame, fecha_inicio: datetime, fecha_fin: datetime, marcas_param: Optional[List[str]]):
-    st.subheader("Análisis Avanzados")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Forecast Estacional (SARIMA)**")
-        with st.spinner("Proyectando tendencias..."):
-            forecast_df = forecast_sarima(df_resumen, periods=3)
-        if not forecast_df.empty:
-            df_plot = forecast_df.copy()
-            df_plot['mes'] = pd.to_datetime(df_plot['mes_iso'])
-            df_plot = df_plot.set_index('mes')[['total', 'forecast']]
-            st.line_chart(df_plot.ffill())
-            st.dataframe(forecast_df.style.format({ 'total': "${:,.2f}", 'forecast': "${:,.2f}"}), use_container_width=True)
-        else:
-            st.info("No hay datos suficientes para forecast.")
-    with col2:
-        st.markdown("**Detección de anomalías (Caché Optimizada)**")
-        try:
-            stats_df = obtener_stats_proveedor(fecha_inicio, fecha_fin, marcas=marcas_param)
-        except Exception as e:
-            st.error(f"Error calculando estadísticas por proveedor: {e}")
-            return
-        q = text("""
-            SELECT id, 'INSUMO' AS "ORIGEN", "FECHA", "PROVEEDOR", COALESCE("INSUMO", "GASTO DE") AS "CONCEPTO",
-                   "FORMA PAGO", "MARCA", "TOTAL"
-            FROM (
-                SELECT id, 'INSUMO' AS origen, FECHA, PROVEEDOR, INSUMO, NULL::text AS "GASTO DE", "FORMA PAGO", "MARCA", TOTAL FROM insumos
-                UNION ALL
-                SELECT id, 'GASTO' AS origen, FECHA, PROVEEDOR, NULL::text AS INSUMO, "GASTO DE", "FORMA PAGO", "MARCA", TOTAL FROM gastos
-            ) t
-            WHERE "FECHA" BETWEEN :inicio AND :fin
-            ORDER BY "FECHA" DESC
-            LIMIT 20000
-        """)
-        try:
-            with ENGINE_GLOBAL.connect() as conn:
-                df_detalle_for_anom = pd.read_sql(q, conn, params={"inicio": fecha_inicio.strftime('%Y-%m-%d'), "fin": fecha_fin.strftime('%Y-%m-%d')}, parse_dates=["FECHA"])
-        except Exception as e:
-            st.error(f"Error trayendo detalle para anomalías: {e}")
-            return
-        if df_detalle_for_anom is not None and not df_detalle_for_anom.empty:
-            with st.spinner("Analizando desviaciones..."):
-                df_anom = detectar_anomalias_con_stats(df_detalle_for_anom, stats_df)
-            st.dataframe(df_anom.sort_values('FECHA', ascending=False).head(200).style.format({"TOTAL": "${:,.2f}"}), use_container_width=True, hide_index=True)
-            st.markdown(f"Total registros analizados: **{len(df_anom)}** — Anomalías detectadas: **{int(df_anom['anomaly'].sum())}**")
-        else:
-            st.info("No hay datos para análisis de anomalías.")
-    st.markdown("---")
-    st.markdown("**Heatmap: gasto por proveedor vs mes**")
-    try:
-        heat = df_resumen.pivot_table(index=COL_PROVEEDOR, columns=COL_ANIO_MES, values=COL_TOTAL, aggfunc='sum', fill_value=0)
-        if not heat.empty:
-            heat_norm = heat.div(heat.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-            st.dataframe(heat_norm.style.format("{:.1%}"), use_container_width=True)
-        else:
-            st.info("Sin datos para heatmap.")
-    except Exception:
-        st.info("No se pudo generar heatmap.")
-
 # -------------------------
-# Main UI[span_10](start_span)[span_10](end_span)
+# Main UI[span_8](start_span)[span_8](end_span)
 # -------------------------
 def mostrar_pestana_recurrencia():
     try:
@@ -607,67 +368,6 @@ def mostrar_pestana_recurrencia():
         st.session_state.refresh_counter += 1
         st.rerun()
     
-    ADMIN_MODE = os.getenv("APP_ADMIN_MODE", "false").lower() in ("1", "true", "yes")
-    with st.sidebar.expander("DB: índices y materialized view (opcional)"):
-        st.markdown("Crear índices y materialized view recomendados para mejorar rendimiento.")
-        sqls = crear_indices_y_mv(run=False)
-        if ADMIN_MODE:
-            st.markdown("**SQL a ejecutar (vista previa)**")
-            for i, s in enumerate(sqls):
-                st.code(s, language='sql')  # <-- CORREGIDO (sin key)
-            st.markdown("**Advertencia:** ejecutar DDL puede afectar la base de datos. Ejecuta solo en horario de baja carga.")
-            with st.form("exec_ddl_form"):
-                run_confirm = st.checkbox("Confirmo que soy administrador y quiero ejecutar estas operaciones", value=False, key="confirm_admin")
-                submit = st.form_submit_button("Ejecutar creación en BD", disabled=not run_confirm, key="exec_ddl_btn")
-                if submit:
-                    if st.session_state.get("ddl_running"):
-                        st.warning("Otra operación DDL está en curso. Espera a que termine.")
-                    else:
-                        st.session_state["ddl_running"] = True
-                        try:
-                            with st.spinner("Ejecutando SQL en la base de datos..."):
-                                res = crear_indices_y_mv(run=True)
-                                st.success("Operación completada.")
-                                st.write(res)
-                                try:
-                                    st.cache_data.clear()
-                                    st.info("Cache invalidado para reflejar cambios.")
-                                except Exception:
-                                    logger.exception("No se pudo invalidar cache automáticamente.")
-                        except Exception as e:
-                            logger.exception("Error ejecutando SQL en BD")
-                            st.error(f"Error ejecutando SQL en BD: {e}")
-                        finally:
-                            st.session_state["ddl_running"] = False
-            
-            with st.form("refresh_mv_form"):
-                refresh_confirm = st.checkbox("Refrescar materialized view mv_resumen_mensual (concurrently)", value=False, key="confirm_refresh")
-                submit_refresh = st.form_submit_button("Refrescar MV", disabled=not refresh_confirm, key="refresh_mv_btn")
-                if submit_refresh:
-                    if st.session_state.get("mv_running"):
-                        st.warning("Otra operación de refresh está en curso.")
-                    else:
-                        st.session_state["mv_running"] = True
-                        try:
-                            with st.spinner("Refrescando materialized view..."):
-                                res = refresh_materialized_views(run=True, executed_by=os.getenv("USER") or os.getenv("USERNAME") or "app_admin")
-                                st.write(res)
-                                try:
-                                    st.cache_data.clear()
-                                    st.info("Cache invalidado tras refresh.")
-                                except Exception:
-                                    logger.exception("No se pudo invalidar cache automáticamente.")
-                        except Exception as e:
-                            logger.exception("Error refrescando MV")
-                            st.error(f"Error refrescando MV: {e}")
-                        finally:
-                            st.session_state["mv_running"] = False
-        else:
-            st.info("Operación restringida: habilita APP_ADMIN_MODE en el entorno para ejecutar DDL desde la UI.")
-            st.markdown("**SQL sugerido (solo vista previa)**")
-            for i, s in enumerate(sqls):
-                st.code(s, language='sql')  # <-- CORREGIDO (sin key)
-            st.markdown("Recomendación: ejecutar estos scripts desde una herramienta de administración (psql, pgAdmin) o programar un job (pg_cron / Supabase Edge Function).")
     st.sidebar.header("Filtros de Análisis")
     try:
         marcas_disponibles = obtener_marcas_disponibles()
@@ -681,11 +381,15 @@ def mostrar_pestana_recurrencia():
         st.stop()
     marcas_param = None if "TODAS" in marcas_sel_ui else marcas_sel_ui
     fecha_hasta = st.sidebar.date_input("Fecha de corte (hasta)", value=datetime.today())
-    meses_ventana = st.sidebar.selectbox("Meses a analizar", [3, 6, 12, 24], index=1)
+    
+    # Se añade la opción de 1 mes 
+    meses_ventana = st.sidebar.selectbox("Meses a analizar", [1, 3, 6, 12, 24], index=1)
     tipo_modulo = st.sidebar.selectbox("Módulo", [TIPO_AMBOS, TIPO_GASTOS, TIPO_INSUMOS], index=0)
+    
     meses_meta = meses_anteriores(datetime(fecha_hasta.year, fecha_hasta.month, 1), meses_ventana)
     fecha_inicio = meses_meta[0]['fecha_inicio']
     fecha_fin = meses_meta[-1]['fecha_fin']
+    
     with st.spinner("Consultando agregados desde la Base de Datos..."):
         try:
             df_resumen = obtener_resumen_agregado(fecha_inicio, fecha_fin, tipo_modulo, marcas=marcas_param, _refresh=st.session_state.refresh_counter)
@@ -693,17 +397,19 @@ def mostrar_pestana_recurrencia():
         except Exception as e:
             st.error(f"Error consultando datos: {e}")
             st.stop()
+            
     if df_resumen.empty:
         st.warning("No se encontraron registros en el rango y marca(s) seleccionados.")
         return
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Resumen y Evolución", 
         "Análisis Pareto", 
         "Concentración Gastos",
         "Concentración Insumos",
-        "Detalle",
-        "Análisis Avanzados"
+        "Detalle"
     ])
+    
     with tab1:
         render_tab_resumen(df_resumen, meses_meta)
     with tab2:
@@ -714,8 +420,6 @@ def mostrar_pestana_recurrencia():
         render_tab_concentracion_insumos(df_ins, df_fp_i, df_resumen)
     with tab5:
         render_tab_detalle(df_resumen, fecha_inicio, fecha_fin, marcas_param)
-    with tab6:
-        render_tab_analisis_avanzados(df_resumen, fecha_inicio, fecha_fin, marcas_param)
 
 if __name__ == "__main__":
     mostrar_pestana_recurrencia()
