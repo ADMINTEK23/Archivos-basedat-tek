@@ -7,9 +7,9 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 from sqlalchemy import text, bindparam
-from db_utils import ENGINE_GLOBAL # Asegurar conexión vía PgBouncer/Supavisor (ej. puerto 6543)[span_5](start_span)[span_5](end_span)
+from db_utils import ENGINE_GLOBAL  # Asegurar conexión vía PgBouncer/Supavisor (ej. puerto 6543)[span_0](start_span)[span_0](end_span)
 
-# Optional sklearn for anomaly detection[span_6](start_span)[span_6](end_span)
+# Optional sklearn for anomaly detection[span_1](start_span)[span_1](end_span)
 try:
     from sklearn.ensemble import IsolationForest
     SKLEARN_AVAILABLE = True
@@ -24,7 +24,7 @@ except Exception:
     STATSMODELS_AVAILABLE = False
 
 # -------------------------
-# Config y constantes[span_7](start_span)[span_7](end_span)
+# Config y constantes[span_2](start_span)[span_2](end_span)
 # -------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ MESES_MAP = {'ENE': 1, 'FEB': 2, 'MAR': 3, 'ABR': 4, 'MAY': 5, 'JUN': 6,
 MESES_INV = {v: k for k, v in MESES_MAP.items()}
 
 # -------------------------
-# Helpers de Fecha[span_8](start_span)[span_8](end_span)
+# Helpers de Fecha[span_3](start_span)[span_3](end_span)
 # -------------------------
 def meses_anteriores(fecha_hasta: datetime, n: int) -> List[Dict[str, Any]]:
     meses = []
@@ -57,7 +57,7 @@ def meses_anteriores(fecha_hasta: datetime, n: int) -> List[Dict[str, Any]]:
     return meses
 
 # -------------------------
-# DB: índices, materialized view y tabla de auditoría[span_9](start_span)[span_9](end_span)
+# DB: índices, materialized view y tabla de auditoría[span_4](start_span)[span_4](end_span)
 # -------------------------
 def crear_indices_y_mv(run: bool = False):
     sqls = [
@@ -105,7 +105,6 @@ def crear_indices_y_mv(run: bool = False):
         return [f"ERROR: {e}"]
 
 def refresh_materialized_views(run: bool = False, executed_by: Optional[str] = None):
-    # Ejecuta el refresco concurrente si la vista ya cuenta con datos y el índice único[span_10](start_span)[span_10](end_span)
     sql_refresh = "REFRESH MATERIALIZED VIEW CONCURRENTLY mv_resumen_mensual;"
     if not run:
         return [sql_refresh]
@@ -129,7 +128,7 @@ def refresh_materialized_views(run: bool = False, executed_by: Optional[str] = N
         return [f"ERROR: {e}"]
 
 # -------------------------
-# Helpers de MARCAS[span_11](start_span)[span_11](end_span)
+# Helpers de MARCAS[span_5](start_span)[span_5](end_span)
 # -------------------------
 @st.cache_data(ttl=600)
 def obtener_marcas_disponibles() -> List[str]:
@@ -144,7 +143,7 @@ def obtener_marcas_disponibles() -> List[str]:
         raise RuntimeError("Error al obtener marcas desde la base de datos: " + str(e))
 
 # =====================================================================
-# 1. MODO AGGREGATE: Consultas SQL que devuelven resúmenes[span_12](start_span)[span_12](end_span)
+# 1. MODO AGGREGATE: Consultas SQL que devuelven resúmenes[span_6](start_span)[span_6](end_span)
 # =====================================================================
 @st.cache_data(ttl=300)
 def obtener_resumen_agregado(fecha_inicio: datetime, fecha_fin: datetime, origen: str, marcas: Optional[List[str]] = None, _refresh: int = 0) -> pd.DataFrame:
@@ -236,7 +235,7 @@ def obtener_metricas_agregadas(fecha_inicio: datetime, fecha_fin: datetime, orig
     return df_cat, df_ins, df_fp_g, df_fp_i
 
 # =====================================================================
-# 2. MODO DETAIL: Seek Cursor Paginado[span_13](start_span)[span_13](end_span)
+# 2. MODO DETAIL: Seek Cursor Paginado[span_7](start_span)[span_7](end_span)
 # =====================================================================
 def obtener_detalle_proveedor_paginado(proveedor: str, fecha_inicio: datetime, fecha_fin: datetime, 
                                        limit: int = 15, last_fecha: str = None, last_id: int = None, marcas: Optional[List[str]] = None) -> Tuple[pd.DataFrame, bool]:
@@ -286,7 +285,7 @@ def obtener_detalle_proveedor_paginado(proveedor: str, fecha_inicio: datetime, f
     return df, has_more
 
 # =====================================================================
-# 3. LÓGICA DE ANÁLISIS EN MEMORIA[span_14](start_span)[span_14](end_span)
+# 3. LÓGICA DE ANÁLISIS EN MEMORIA[span_8](start_span)[span_8](end_span)
 # =====================================================================
 def clasificacion_abc(df_agregado: pd.DataFrame) -> pd.DataFrame:
     if df_agregado.empty: return pd.DataFrame()
@@ -307,7 +306,7 @@ def pareto_evolucion(df_resumen: pd.DataFrame, meses_meta: List[Dict[str, Any]])
         tmp['pct'] = tmp[COL_TOTAL] / tmp[COL_TOTAL].sum()
         tmp['cum_pct'] = tmp['pct'].cumsum()
         tmp['mes'] = mes
-        out.append(tmp[[ 'mes', COL_PROVEEDOR, COL_TOTAL, 'pct', 'cum_pct']])
+        out.append(tmp[['mes', COL_PROVEEDOR, COL_TOTAL, 'pct', 'cum_pct']])
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -325,7 +324,6 @@ def forecast_sarima(df_resumen: pd.DataFrame, periods: int = 3) -> pd.DataFrame:
     future_x = np.arange(len(series), len(series) + periods)
     future_dates = [series['mes_iso'].max() + relativedelta(months=i+1) for i in range(periods)]
     
-    # Evaluar uso de SARIMA si hay datos suficientes e instalación de statsmodels
     if STATSMODELS_AVAILABLE and len(series) >= 12:
         try:
             model = SARIMAX(series[COL_TOTAL].values, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12))
@@ -339,7 +337,6 @@ def forecast_sarima(df_resumen: pd.DataFrame, periods: int = 3) -> pd.DataFrame:
             series['forecast'] = poly(series['x'])
             forecast_vals = poly(future_x)
     else:
-        # Fallback a polinomial simple si no hay histórico suficiente
         coef = np.polyfit(series['x'], series[COL_TOTAL], 1)
         poly = np.poly1d(coef)
         series['forecast'] = poly(series['x'])
@@ -408,7 +405,7 @@ def detectar_anomalias_con_stats(df_detalle: pd.DataFrame, stats_df: pd.DataFram
     return df.drop(columns=['TOTAL_NUM', 'z', 'anomaly_z', 'anomaly_iforest'], errors='ignore')
 
 # =====================================================================
-# 4. INTERFAZ STREAMLIT[span_15](start_span)[span_15](end_span)
+# 4. INTERFAZ STREAMLIT[span_9](start_span)[span_9](end_span)
 # =====================================================================
 def render_tab_resumen(df_resumen: pd.DataFrame, meses_meta: List[Dict[str, Any]]):
     st.subheader("Resumen: Totales por Proveedor")
@@ -589,7 +586,7 @@ def render_tab_analisis_avanzados(df_resumen: pd.DataFrame, fecha_inicio: dateti
         st.info("No se pudo generar heatmap.")
 
 # -------------------------
-# Main UI[span_16](start_span)[span_16](end_span)
+# Main UI[span_10](start_span)[span_10](end_span)
 # -------------------------
 def mostrar_pestana_recurrencia():
     try:
@@ -617,7 +614,7 @@ def mostrar_pestana_recurrencia():
         if ADMIN_MODE:
             st.markdown("**SQL a ejecutar (vista previa)**")
             for i, s in enumerate(sqls):
-                st.code(s, language='sql', key=f"sql_preview_{i}")
+                st.code(s, language='sql')  # <-- CORREGIDO (sin key)
             st.markdown("**Advertencia:** ejecutar DDL puede afectar la base de datos. Ejecuta solo en horario de baja carga.")
             with st.form("exec_ddl_form"):
                 run_confirm = st.checkbox("Confirmo que soy administrador y quiero ejecutar estas operaciones", value=False, key="confirm_admin")
@@ -669,7 +666,7 @@ def mostrar_pestana_recurrencia():
             st.info("Operación restringida: habilita APP_ADMIN_MODE en el entorno para ejecutar DDL desde la UI.")
             st.markdown("**SQL sugerido (solo vista previa)**")
             for i, s in enumerate(sqls):
-                st.code(s, language='sql', key=f"sql_preview_ro_{i}")
+                st.code(s, language='sql')  # <-- CORREGIDO (sin key)
             st.markdown("Recomendación: ejecutar estos scripts desde una herramienta de administración (psql, pgAdmin) o programar un job (pg_cron / Supabase Edge Function).")
     st.sidebar.header("Filtros de Análisis")
     try:
