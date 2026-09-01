@@ -1,31 +1,109 @@
-import streamlit as st
-import pandas as pd
+import logging
 import time
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from typing import Dict, Optional
+
+import pandas as pd
+import streamlit as st
 from sqlalchemy import text
+
+# Import original helpers (se mantienen)
 from db_utils import obtener_engine_maestro, cargar_datos_optimizados
 
-def normalizar(valor):
+# -------------------------
+# Configuración y constantes
+# -------------------------
+logger = logging.getLogger("traspasos")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+SELECT_PROMPT = "-- Seleccionar --"
+CACHE_TTL_DATOS = 300  # segundos
+
+# SQL templates (extraídos para mantener el código limpio)
+SQL_INSERT_INSUMO = text(
+    '''
+    INSERT INTO insumos 
+    ("FECHA", "INSUMO", "TIPO", "PROVEEDOR", "UNIDAD", "COSTO", "TOTAL", "DÍA", "USUARIO", "MARCA", "FORMA PAGO") 
+    VALUES 
+    (:f, :ins, :t, :p, :u, :c, :tot, :d, :user, :m, :fp)
+    '''
+)
+
+SQL_INSERT_GASTO = text(
+    '''
+    INSERT INTO gastos 
+    ("FECHA", "GASTO DE", "TIPO", "CATEGORÍA", "PROVEEDOR", "UNIDAD", "COSTO", "TOTAL", "DÍA", "RECURRENCIA", "USUARIO", "MARCA", "FORMA PAGO") 
+    VALUES 
+    (:f, :g, :t, :c, :p, :u, :co, :tot, :d, :rec, :user, :m, :fp)
+    '''
+)
+
+# -------------------------
+# Caché y utilidades
+# -------------------------
+@st.cache_resource
+def get_engine():
+    """Devuelve engine DB cacheado por sesión/app."""
+    logger.info("Creando engine de base de datos (cacheado).")
+    return obtener_engine_maestro()
+
+@st.cache_data(ttl=CACHE_TTL_DATOS)
+def get_datos_cache(anio: int):
+    """Carga y cachea datos optimizados por año."""
+    logger.info("Cargando datos optimizados para año %s", anio)
+    return cargar_datos_optimizados(anio)
+
+@st.cache_data
+def opciones_por_marca(df: pd.DataFrame, col: str) -> Dict[str, list]:
+    """Devuelve un dict marca -> lista de valores ordenados por frecuencia para la columna col."""
+    if df is None or df.empty or 'MARCA' not in df.columns or col not in df.columns:
+        return {}
+    grouped = df.groupby('MARCA')[col].apply(lambda s: s.value_counts().index.tolist())
+    return grouped.to_dict()
+
+def normalizar(valor: Optional[str]) -> str:
     return str(valor).strip().upper() if valor else ""
 
-def obtener_opciones(df, columna, defecto=None):
+def obtener_opciones(df: pd.DataFrame, columna: str, defecto: Optional[str] = None):
     if df is not None and not df.empty and columna in df.columns:
         return sorted(list(df[columna].dropna().unique()))
     return [defecto] if defecto else []
 
-def obtener_opciones_frecuentes(df, columna, marca=None, defecto=None):
-    if df is not None and not df.empty and columna in df.columns:
-        df_target = df
-        if marca and 'MARCA' in df.columns:
-            df_marca = df[df['MARCA'] == marca]
-            if not df_marca.empty:
-                df_target = df_marca
-        frecuentes = df_target[columna].value_counts().index.tolist()
-        return frecuentes
-    return [defecto] if defecto else []
+def obtener_opciones_frecuentes_cached(map_por_marca: Dict[str, list], marca: str, defecto: Optional[str] = None):
+    if not map_por_marca:
+        return [defecto] if defecto else []
+    return map_por_marca.get(marca, [])
 
-def mostrar_historial(df, filtro_col, filtro_val):
+def obtener_ultimo_costo(df: pd.DataFrame, fecha_col: str = "FECHA", costo_col: str = "COSTO"):
+    """Obtiene el costo más reciente de un df ya filtrado por concepto."""
+    if df is None or df.empty:
+        return 0.0
+    # usar idxmax o nlargest para eficiencia
+    try:
+        idx = df[fecha_col].idxmax()
+        return float(df.at[idx, costo_col])
+    except Exception:
+        # fallback
+        return float(df.nlargest(1, fecha_col)[costo_col].iat[0])
+
+# -------------------------
+# Inserciones DB encapsuladas
+# -------------------------
+def insertar_insumo(conn, params: dict):
+    conn.execute(SQL_INSERT_INSUMO, params)
+
+def insertar_gasto(conn, params: dict):
+    conn.execute(SQL_INSERT_GASTO, params)
+
+# -------------------------
+# UI principal
+# -------------------------
+def mostrar_historial(df: pd.DataFrame, filtro_col: str, filtro_val):
     if df is None or df.empty:
         st.info("Sin registros previos.")
         return
@@ -36,31 +114,47 @@ def mostrar_historial(df, filtro_col, filtro_val):
 
     df_hist = df_f.sort_values(by='FECHA', ascending=False).drop_duplicates(subset=['COSTO'], keep='first')
     cols = [c for c in ['FECHA', filtro_col, 'TIPO', 'PROVEEDOR', 'COSTO'] if c in df_hist.columns]
-    
     st.dataframe(df_hist[cols].head(10), hide_index=True, use_container_width=True)
-    st.caption("Mostrando los últimos 10 precios.")
+    st.caption("Mostrando los últimos 10 costos.")
 
 def mostrar_modulo_traspasos():
     st.header("🔄 Sistema de Traspasos/Préstamos")
-    st.markdown("Transfiere entre sucursales.")
-    
+    st.markdown("Transfiere entre sucursales. El formulario cuenta con 2 pasos para confirmar antes de guardar.")
+
+    # Inicializar estado
     st.session_state.setdefault("pending_traspaso", None)
     st.session_state.setdefault("log_sesion", [])
-    
+    st.session_state.setdefault("usuario_actual", st.session_state.get("usuario_actual", "ANÓNIMO"))
+
     operador_actual = normalizar(st.session_state.get("usuario_actual", "ANÓNIMO"))
-    engine = obtener_engine_maestro()
+    engine = get_engine()
     anio_actual = datetime.now().year
-    
-    # IMPORTANTE: Aquí regresamos a la forma original de cargar datos de tu base
-    _, df_insumos, df_gastos = cargar_datos_optimizados(anio_actual)
-    
+
+    # Cargar datos cacheados
+    try:
+        datos = get_datos_cache(anio_actual)
+        if isinstance(datos, tuple) and len(datos) >= 3:
+            _, df_insumos, df_gastos = datos
+        else:
+            # fallback si la estructura cambia
+            df_insumos = datos.get("insumos") if isinstance(datos, dict) else None
+            df_gastos = datos.get("gastos") if isinstance(datos, dict) else None
+    except Exception as e:
+        logger.exception("Error cargando datos optimizados: %s", e)
+        st.error("No se pudieron cargar los datos. Intenta recargar la app.")
+        return
+
     tipo_traspaso = st.radio("¿Qué deseas traspasar?", ["Insumos", "Gastos"], horizontal=True)
     st.markdown("---")
-    
+
+    # Precomputar opciones por marca (cacheadas)
+    ins_por_marca = opciones_por_marca(df_insumos, 'INSUMO') if df_insumos is not None else {}
+    gas_por_marca = opciones_por_marca(df_gastos, 'GASTO DE') if df_gastos is not None else {}
+
     marcas_ins = obtener_opciones(df_insumos, 'MARCA')
     marcas_gas = obtener_opciones(df_gastos, 'MARCA')
     marcas_existentes = sorted(list(set(marcas_ins + marcas_gas)))
-    
+
     if not marcas_existentes:
         st.warning("No hay datos suficientes en las tablas de Insumos/Gastos para cargar las sucursales.")
         return
@@ -69,58 +163,65 @@ def mostrar_modulo_traspasos():
     with col_o:
         marca_origen = st.selectbox("MARCA ORIGEN", marcas_existentes, key="marca_out")
     with col_d:
-        marca_destino = st.selectbox("MARCA DESTINO", marcas_existentes, index=1 if len(marcas_existentes)>1 else 0, key="marca_in")
+        default_idx = 1 if len(marcas_existentes) > 1 else 0
+        marca_destino = st.selectbox("MARCA DESTINO", marcas_existentes, index=default_idx, key="marca_in")
     with col_f:
         fecha_traspaso = st.date_input("🗓️ Fecha del Traspaso", datetime.now())
-        
+
     if marca_origen == marca_destino:
         st.warning("⚠️ La sucursal de origen y destino no pueden ser la misma.")
         return
 
-    dia_semana = ["LUNES","MARTES","MIÉRCOLES","JUEVES","VIERNES","SÁBADO","DOMINGO"][fecha_traspaso.weekday()]
+    dia_semana = ["LUNES", "MARTES", "MIÉRCOLES", "JUEVES", "VIERNES", "SÁBADO", "DOMINGO"][fecha_traspaso.weekday()]
 
     st.subheader("Paso 1 — Datos del movimiento")
-    
+
+    # 1. Selección dinámica (FUERA del st.form para permitir reactividad inmediata)
+    concepto_sel = SELECT_PROMPT
+    tipo_sel = None
+    cat_sel = None
+    rec_sel = None
+    ultimo_costo = 0.0
+
+    if tipo_traspaso == "Insumos":
+        ins_lista = obtener_opciones_frecuentes_cached(ins_por_marca, marca_origen)
+        concepto_sel = st.selectbox("Selecciona el Insumo", [SELECT_PROMPT] + ins_lista)
+        if concepto_sel != SELECT_PROMPT:
+            df_filtro = df_insumos[df_insumos['INSUMO'] == concepto_sel]
+            tipo_sel = st.selectbox("Tipo", obtener_opciones(df_filtro, 'TIPO'))
+            ultimo_costo = obtener_ultimo_costo(df_filtro) if not df_filtro.empty else 0.0
+    else:
+        gasto_lista = obtener_opciones_frecuentes_cached(gas_por_marca, marca_origen)
+        concepto_sel = st.selectbox("Selecciona el Gasto", [SELECT_PROMPT] + gasto_lista)
+        if concepto_sel != SELECT_PROMPT:
+            df_filtro = df_gastos[df_gastos['GASTO DE'] == concepto_sel]
+            tipo_sel = st.selectbox("Tipo", obtener_opciones(df_filtro, 'TIPO', "OPERATIVO"))
+            cat_sel = st.selectbox("Categoría:", obtener_opciones(df_filtro, 'CATEGORÍA'))
+            rec_sel = st.selectbox("Recurrencia:", obtener_opciones(df_filtro, 'RECURRENCIA', "VARIABLE"))
+            ultimo_costo = obtener_ultimo_costo(df_filtro) if not df_filtro.empty else 0.0
+
+    # 2. Formulario para confirmación e ingreso numérico
     with st.form(key="traspaso_form"):
-        concepto_sel = "-- Seleccionar --"
-        tipo_sel = None
-        cat_sel = None
-        rec_sel = None
-        ultimo_costo = 0.0
-
-        if tipo_traspaso == "Insumos":
-            ins_lista = obtener_opciones_frecuentes(df_insumos, 'INSUMO', marca=marca_origen)
-            concepto_sel = st.selectbox("Selecciona el Insumo (ordenado por frecuencia):", ["-- Seleccionar --"] + ins_lista)
-            
-            if concepto_sel != "-- Seleccionar --":
-                df_filtro = df_insumos[df_insumos['INSUMO'] == concepto_sel]
-                tipo_sel = st.selectbox("Tipo / Presentación:", obtener_opciones(df_filtro, 'TIPO'))
-                if not df_filtro.empty:
-                    ultimo_costo = float(df_filtro.sort_values(by='FECHA', ascending=False)['COSTO'].iloc[0])
-                    
-        else: # Gastos
-            gasto_lista = obtener_opciones_frecuentes(df_gastos, 'GASTO DE', marca=marca_origen)
-            concepto_sel = st.selectbox("Selecciona el Concepto de Gasto:", ["-- Seleccionar --"] + gasto_lista)
-            
-            if concepto_sel != "-- Seleccionar --":
-                df_filtro = df_gastos[df_gastos['GASTO DE'] == concepto_sel]
-                tipo_sel = st.selectbox("Tipo:", obtener_opciones(df_filtro, 'TIPO', "OPERATIVO"))
-                cat_sel = st.selectbox("Categoría:", obtener_opciones(df_filtro, 'CATEGORÍA'))
-                rec_sel = st.selectbox("Recurrencia:", obtener_opciones(df_filtro, 'RECURRENCIA', "VARIABLE"))
-                if not df_filtro.empty:
-                    ultimo_costo = float(df_filtro.sort_values(by='FECHA', ascending=False)['COSTO'].iloc[0])
-
         col1, col2 = st.columns(2)
-        cantidad = col1.number_input("Cantidad a traspasar (UNIDAD):", min_value=0.01, value=1.00, step=0.01)
-        costo_unit = col2.number_input("Costo Unitario ($):", min_value=0.0, value=ultimo_costo, step=1.0)
-        
+        # Se elimina el min_value para permitir negativos. 
+        # step=1e-14 permite que a nivel subyacente la entrada acepte hasta 14 decimales 
+        # format="%.2f" obliga a que la visualización final sea de solo 2 decimales.
+        cantidad = col1.number_input("Unidades a traspasar", value=1.00, step=1e-14, format="%.2f")
+        costo_unit = col2.number_input("Costo Unitario ($):", value=float(ultimo_costo), step=1e-14, format="%.2f")
+
         btn_siguiente = st.form_submit_button("Siguiente — Revisar resumen")
 
     if btn_siguiente:
-        if concepto_sel == "-- Seleccionar --":
-            st.error("Por favor, selecciona un concepto válido antes de continuar.")
+        # Validaciones
+        if concepto_sel == SELECT_PROMPT:
+            st.error("Por favor, selecciona un concepto válido.")
+        elif cantidad == 0:
+            st.error("La cantidad no puede ser exactamente 0.")
+        elif costo_unit == 0:
+            st.error("El costo unitario no puede ser exactamente 0.")
         else:
-            total_traspaso = cantidad * costo_unit
+            # Redondeo financiero para totalizar
+            total_traspaso = round(cantidad * costo_unit, 2)
             st.session_state["pending_traspaso"] = {
                 "tipo_traspaso": tipo_traspaso,
                 "concepto": concepto_sel,
@@ -133,16 +234,15 @@ def mostrar_modulo_traspasos():
                 "proveedor_texto": f"{marca_origen} A {marca_destino}"
             }
 
+    # Paso 2: resumen y confirmación
     if st.session_state.get("pending_traspaso"):
         pending = st.session_state["pending_traspaso"]
         st.markdown("---")
         st.subheader("Paso 2 — Resumen y confirmación")
-        
+
         st.info(
-            f"**Ruta:** {marca_origen} ➔ {marca_destino}  
-"
-            f"**Concepto:** {pending['concepto']} ({pending['tipo']})  
-"
+            f"**Ruta:** {marca_origen} ➔ {marca_destino} \n\n"
+            f"**Concepto:** {pending['concepto']} ({pending['tipo']}) \n\n"
             f"**Cant:** {pending['cantidad']} | **Costo U:** ${pending['costo_unit']:.2f} | **Total:** ${pending['total']:.2f}"
         )
 
@@ -152,40 +252,56 @@ def mostrar_modulo_traspasos():
                 forma_pago_traspaso = "TRASPASO"
                 try:
                     with engine.begin() as conn:
+                        # Preparar parámetros comunes
+                        params_origen = {
+                            "f": str(fecha_traspaso),
+                            "p": pending["proveedor_texto"],
+                            "u": -pending["cantidad"],
+                            "d": dia_semana,
+                            "user": operador_actual,
+                            "fp": forma_pago_traspaso
+                        }
+                        params_destino = params_origen.copy()
+                        params_destino["u"] = pending["cantidad"]
+
                         if pending["tipo_traspaso"] == "Insumos":
-                            query_ins = text('''
-                                INSERT INTO insumos 
-                                ("FECHA", "INSUMO", "TIPO", "PROVEEDOR", "UNIDAD", "COSTO", "TOTAL", "DÍA", "USUARIO", "MARCA", "FORMA PAGO") 
-                                VALUES 
-                                (:f, :ins, :t, :p, :u, :c, :tot, :d, :user, :m, :fp)
-                            ''')
-                            conn.execute(query_ins, {
-                                "f": str(fecha_traspaso), "ins": pending["concepto"], "t": pending["tipo"], "p": pending["proveedor_texto"],
-                                "u": -pending["cantidad"], "c": pending["costo_unit"], "tot": -pending["total"], "d": dia_semana,
-                                "user": operador_actual, "m": marca_origen, "fp": forma_pago_traspaso
+                            params_origen.update({
+                                "ins": pending["concepto"],
+                                "t": pending["tipo"],
+                                "c": pending["costo_unit"],
+                                "tot": -pending["total"],
+                                "m": marca_origen
                             })
-                            conn.execute(query_ins, {
-                                "f": str(fecha_traspaso), "ins": pending["concepto"], "t": pending["tipo"], "p": pending["proveedor_texto"],
-                                "u": pending["cantidad"], "c": pending["costo_unit"], "tot": pending["total"], "d": dia_semana,
-                                "user": operador_actual, "m": marca_destino, "fp": forma_pago_traspaso
+                            params_destino.update({
+                                "ins": pending["concepto"],
+                                "t": pending["tipo"],
+                                "c": pending["costo_unit"],
+                                "tot": pending["total"],
+                                "m": marca_destino
                             })
-                        else: # Gastos
-                            query_gas = text('''
-                                INSERT INTO gastos 
-                                ("FECHA", "GASTO DE", "TIPO", "CATEGORÍA", "PROVEEDOR", "UNIDAD", "COSTO", "TOTAL", "DÍA", "RECURRENCIA", "USUARIO", "MARCA", "FORMA PAGO") 
-                                VALUES 
-                                (:f, :g, :t, :c, :p, :u, :co, :tot, :d, :rec, :user, :m, :fp)
-                            ''')
-                            conn.execute(query_gas, {
-                                "f": str(fecha_traspaso), "g": pending["concepto"], "t": pending["tipo"], "c": pending["cat"], "p": pending["proveedor_texto"],
-                                "u": -pending["cantidad"], "co": pending["costo_unit"], "tot": -pending["total"], "d": dia_semana, "rec": pending["rec"],
-                                "user": operador_actual, "m": marca_origen, "fp": forma_pago_traspaso
+                            insertar_insumo(conn, params_origen)
+                            insertar_insumo(conn, params_destino)
+                        else:
+                            params_origen.update({
+                                "g": pending["concepto"],
+                                "t": pending["tipo"],
+                                "c": pending["cat"],
+                                "co": pending["costo_unit"],
+                                "tot": -pending["total"],
+                                "rec": pending["rec"],
+                                "m": marca_origen
                             })
-                            conn.execute(query_gas, {
-                                "f": str(fecha_traspaso), "g": pending["concepto"], "t": pending["tipo"], "c": pending["cat"], "p": pending["proveedor_texto"],
-                                "u": pending["cantidad"], "co": pending["costo_unit"], "tot": pending["total"], "d": dia_semana, "rec": pending["rec"],
-                                "user": operador_actual, "m": marca_destino, "fp": forma_pago_traspaso
+                            params_destino.update({
+                                "g": pending["concepto"],
+                                "t": pending["tipo"],
+                                "c": pending["cat"],
+                                "co": pending["costo_unit"],
+                                "tot": pending["total"],
+                                "rec": pending["rec"],
+                                "m": marca_destino
                             })
+                            insertar_gasto(conn, params_origen)
+                            insertar_gasto(conn, params_destino)
 
                     st.success("✅ Traspaso ejecutado correctamente.")
                     st.session_state["log_sesion"].insert(0, {
@@ -195,19 +311,27 @@ def mostrar_modulo_traspasos():
                         "Total": f"${pending['total']:.2f}",
                         "Ruta": f"{marca_origen} -> {marca_destino}"
                     })
+                    # limpiar estado y cache local
                     st.session_state["pending_traspaso"] = None
-                    cargar_datos_optimizados.clear(anio_actual)
-                    time.sleep(1.5)
+                    try:
+                        get_datos_cache.clear()
+                    except Exception:
+                        logger.debug("No se pudo limpiar cache de datos.")
+                    time.sleep(1.0)
+                    # Actualización st.rerun() aplicada
                     st.rerun()
 
                 except Exception as e:
-                    st.error(f"Error al escribir en base de datos: {e}")
+                    logger.exception("Error al escribir en base de datos", e)
+                    st.error("Error al escribir en base de datos. Manda una captura a Alan")
 
         with col_cancel:
             if st.button("❌ Cancelar", use_container_width=True):
                 st.session_state["pending_traspaso"] = None
+                # Actualización st.rerun() aplicada
                 st.rerun()
 
+    # Mostrar log de sesión
     if st.session_state["log_sesion"]:
         st.markdown("---")
         with st.expander("📋 Traspasos realizados en esta sesión", expanded=False):
@@ -217,16 +341,16 @@ def mostrar_modulo_traspasos():
     concepto_a_buscar = None
     if st.session_state.get("pending_traspaso"):
         concepto_a_buscar = st.session_state["pending_traspaso"]["concepto"]
-    elif 'concepto_sel' in locals() and concepto_sel != "-- Seleccionar --":
+    elif 'concepto_sel' in locals() and concepto_sel != SELECT_PROMPT:
         concepto_a_buscar = concepto_sel
 
     if concepto_a_buscar:
-        st.subheader("Historial de costos")
+        st.subheader("Historial de últimos costos")
         target_df = df_insumos if tipo_traspaso == "Insumos" else df_gastos
         target_col = 'INSUMO' if tipo_traspaso == "Insumos" else 'GASTO DE'
         mostrar_historial(target_df, target_col, concepto_a_buscar)
     else:
-        st.info("💡 Selecciona un insumo o gasto para ver su historial de precios recientes.")
+        st.info("💡 Selecciona un insumo o gasto para ver su historial de costos recientes.")
 
 if __name__ == "__main__":
     mostrar_modulo_traspasos()
