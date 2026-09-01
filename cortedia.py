@@ -1,6 +1,7 @@
 import logging
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, Optional
 
 import pandas as pd
@@ -24,22 +25,22 @@ logger.setLevel(logging.INFO)
 SELECT_PROMPT = "-- Seleccionar --"
 CACHE_TTL_DATOS = 300  # segundos
 
-# SQL templates
+# SQL templates (ahora incluyen FECHA_CAPTURA :fc)
 SQL_INSERT_INSUMO = text(
     '''
     INSERT INTO insumos 
-    ("FECHA", "INSUMO", "TIPO", "PROVEEDOR", "UNIDAD", "COSTO", "TOTAL", "DÍA", "USUARIO", "MARCA", "FORMA PAGO") 
+    ("FECHA", "FECHA_CAPTURA", "INSUMO", "TIPO", "PROVEEDOR", "UNIDAD", "COSTO", "TOTAL", "DÍA", "USUARIO", "MARCA", "FORMA PAGO") 
     VALUES 
-    (:f, :ins, :t, :p, :u, :c, :tot, :d, :user, :m, :fp)
+    (:f, :fc, :ins, :t, :p, :u, :c, :tot, :d, :user, :m, :fp)
     '''
 )
 
 SQL_INSERT_GASTO = text(
     '''
     INSERT INTO gastos 
-    ("FECHA", "GASTO DE", "TIPO", "CATEGORÍA", "PROVEEDOR", "UNIDAD", "COSTO", "TOTAL", "DÍA", "RECURRENCIA", "USUARIO", "MARCA", "FORMA PAGO") 
+    ("FECHA", "FECHA_CAPTURA", "GASTO DE", "TIPO", "CATEGORÍA", "PROVEEDOR", "UNIDAD", "COSTO", "TOTAL", "DÍA", "RECURRENCIA", "USUARIO", "MARCA", "FORMA PAGO") 
     VALUES 
-    (:f, :g, :t, :c, :p, :u, :co, :tot, :d, :rec, :user, :m, :fp)
+    (:f, :fc, :g, :t, :c, :p, :u, :co, :tot, :d, :rec, :user, :m, :fp)
     '''
 )
 
@@ -210,9 +211,25 @@ def mostrar_modulo_traspasos():
             proveedor_texto = f"{marca_origen} A {marca_destino}"
             
             try:
+                # Obtener fecha/hora actual en CDMX al momento de la ejecución
+                tz_cdmx = ZoneInfo("America/Mexico_City")
+                now_cdmx = datetime.now(tz_cdmx)
+
+                # Combinar la fecha seleccionada por el usuario con la hora actual de CDMX
+                fecha_con_hora = datetime.combine(fecha_traspaso, now_cdmx.timetz())
+                # Asegurar que el objeto resultante tenga la zona horaria de CDMX
+                fecha_con_hora = fecha_con_hora.replace(tzinfo=tz_cdmx)
+
+                # Formato para la DB:
+                # - Si tu columna FECHA_CAPTURA es timestamptz, enviar ISO con offset para que Postgres lo parsee correctamente.
+                fecha_captura_iso = fecha_con_hora.isoformat()   # e.g. '2026-09-01T16:06:12-05:00'
+                # Para la columna FECHA (date) usamos solo la parte de fecha
+                fecha_date_str = fecha_traspaso.strftime("%Y-%m-%d")
+
                 with engine.begin() as conn:
                     params_origen = {
-                        "f": str(fecha_traspaso),
+                        "f": fecha_date_str,
+                        "fc": fecha_captura_iso,
                         "p": proveedor_texto,
                         "u": -cantidad,
                         "d": dia_semana,
@@ -243,13 +260,14 @@ def mostrar_modulo_traspasos():
 
                 st.success("✅ Traspaso ejecutado correctamente.")
                 st.session_state["log_sesion"].insert(0, {
-                    "Hora": datetime.now().strftime("%H:%M:%S"),
+                    "Hora": fecha_con_hora.strftime("%H:%M:%S"),
                     "Concepto": concepto_sel,
                     "Cant": cantidad,
                     "Total": f"${total_traspaso:.2f}",
                     "Ruta": f"{marca_origen} -> {marca_destino}"
                 })
                 try:
+                    # Limpiar cache de datos para forzar recarga
                     get_datos_cache.clear()
                 except Exception:
                     logger.debug("No se pudo limpiar cache de datos.")
@@ -271,7 +289,7 @@ def mostrar_modulo_traspasos():
     
     # Mostrar historial en base al concepto seleccionado en la interfaz
     if 'concepto_sel' in locals() and concepto_sel != SELECT_PROMPT:
-        st.subheader("Historial de precios del concepto")
+        st.subheader("Historial de costos")
         target_df = df_insumos if tipo_traspaso == "Insumos" else df_gastos
         target_col = 'INSUMO' if tipo_traspaso == "Insumos" else 'GASTO DE'
         mostrar_historial(target_df, target_col, concepto_sel)
