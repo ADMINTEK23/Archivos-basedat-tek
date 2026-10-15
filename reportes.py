@@ -2,6 +2,9 @@ import logging
 from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 from typing import List, Tuple, Optional
+from itertools import combinations
+from collections import Counter
+import numpy as np
 
 import streamlit as st
 import pandas as pd
@@ -96,16 +99,41 @@ def clear_caches_reportes():
             pass
 
 # -------------------------
-# Modelos ligeros usando pandas + numpy (sin dependencias externas)
-# Cinco modelos principales (sin ARIMA/SARIMA)
-# 1) Naive estacional (promedio por día de semana)
-# 2) Media móvil
-# 3) Suavizado exponencial simple (SES)
-# 4) Tendencia lineal (polyfit)
-# 5) Modelo aditivo simple tipo "Prophet-like" (tendencia + estacionalidad semanal + feriados opcionales)
+# Funciones de Análisis de Productos y Comportamiento
 # -------------------------
-import numpy as np
+def analizar_horarios(df: pd.DataFrame) -> pd.DataFrame:
+    """Agrupa las ventas usando la columna 'HORA NÚMERO'."""
+    if 'HORA NÚMERO' not in df.columns: 
+        return pd.DataFrame()
+    return df.groupby('HORA NÚMERO')['TOTAL'].sum().reset_index()
 
+def analizar_venta_cruzada(df: pd.DataFrame, top_n=10) -> pd.DataFrame:
+    """Encuentra los pares de productos usando 'NÚMERO DE VENTA' y 'PRODUCTO'."""
+    if 'NÚMERO DE VENTA' not in df.columns or 'PRODUCTO' not in df.columns:
+        return pd.DataFrame()
+    
+    # Agrupar productos únicos por cada Número de Venta
+    tickets = df.groupby('NÚMERO DE VENTA')['PRODUCTO'].apply(lambda x: list(set(x.dropna())))
+    
+    # Contar combinaciones de 2 productos
+    pares = Counter()
+    for productos_en_ticket in tickets:
+        if len(productos_en_ticket) > 1:
+            for par in combinations(sorted(productos_en_ticket), 2):
+                pares[par] += 1
+                
+    # Convertir a DataFrame
+    df_pares = pd.DataFrame(pares.most_common(top_n), columns=['Par_de_Productos', 'Frecuencia'])
+    if not df_pares.empty:
+        df_pares['Producto 1'] = df_pares['Par_de_Productos'].apply(lambda x: x[0])
+        df_pares['Producto 2'] = df_pares['Par_de_Productos'].apply(lambda x: x[1])
+        return df_pares[['Producto 1', 'Producto 2', 'Frecuencia']]
+    return pd.DataFrame()
+
+
+# -------------------------
+# Modelos ligeros de Pronóstico
+# -------------------------
 @st.cache_data(ttl=TTL_VENTAS_HIST)
 def preparar_serie_diaria_simple(df: pd.DataFrame, marca: Optional[str]=None, sucursal: Optional[str]=None) -> pd.DataFrame:
     """Devuelve serie diaria agregada con columnas ds (datetime) y y (float)."""
@@ -164,7 +192,7 @@ def forecast_exp_smoothing(serie: pd.DataFrame, horizon: int, alpha: Optional[fl
     future_idx = pd.date_range(serie['ds'].max() + pd.Timedelta(days=1), periods=horizon, freq='D')
     return pd.DataFrame({'ds': future_idx, 'yhat': preds})
 
-# 4) Tendencia lineal (extrapolación con polyfit)
+# 4) Tendencia lineal
 def forecast_linear_trend(serie: pd.DataFrame, horizon: int):
     df = serie.copy().reset_index(drop=True)
     x = np.arange(len(df))
@@ -178,18 +206,11 @@ def forecast_linear_trend(serie: pd.DataFrame, horizon: int):
     future_idx = pd.date_range(df['ds'].iloc[-1] + pd.Timedelta(days=1), periods=horizon, freq='D')
     return pd.DataFrame({'ds': future_idx, 'yhat': preds})
 
-# 5) Modelo aditivo simple tipo "Prophet-like" (tendencia + estacionalidad semanal + feriados opcionales)
+# 5) Modelo aditivo simple 
 def forecast_additive_simple(serie: pd.DataFrame, horizon: int, holidays: Optional[List[date]] = None, trend_degree: int = 1):
-    """
-    Modelo aditivo simple:
-    - Tendencia: polinomio de grado trend_degree (por defecto 1)
-    - Estacionalidad semanal: promedio por día de semana (dow)
-    - Feriados: efecto medio observado en feriados (si se proveen)
-    La predicción es: trend(t) + seasonal(dow) + holiday_effect (si aplica)
-    """
     df = serie.copy().reset_index(drop=True)
-    df['t'] = np.arange(len(df))  # tiempo
-    # Tendencia (polyfit)
+    df['t'] = np.arange(len(df))  
+    
     if len(df) < 2:
         trend_vals = np.zeros(horizon)
     else:
@@ -197,17 +218,14 @@ def forecast_additive_simple(serie: pd.DataFrame, horizon: int, holidays: Option
         future_t = np.arange(len(df), len(df) + horizon)
         trend_vals = np.polyval(coef, future_t)
 
-    # Estacionalidad semanal
     df_idxed = serie.copy().set_index('ds')
     df_idxed['dow'] = df_idxed.index.dayofweek
     seasonal_mean = df_idxed.groupby('dow')['y'].mean().to_dict()
     future_idx = pd.date_range(serie['ds'].max() + pd.Timedelta(days=1), periods=horizon, freq='D')
     seasonal_vals = np.array([seasonal_mean.get(d.dayofweek, df_idxed['y'].mean()) for d in future_idx])
 
-    # Efecto feriados (si se proveen): calculamos promedio de desviación en feriados respecto a estacional+trend histórica
     holiday_effect = np.zeros(horizon)
     if holidays:
-        # construir mapa de fechas históricas a efectos
         hist_effects = []
         for h in holidays:
             try:
@@ -216,7 +234,6 @@ def forecast_additive_simple(serie: pd.DataFrame, horizon: int, holidays: Option
                 continue
             if h_dt in df_idxed.index.date:
                 val = df_idxed.loc[df_idxed.index.date == h_dt, 'y'].sum()
-                # baseline: promedio del mismo dow
                 dow = pd.to_datetime(h_dt).dayofweek
                 baseline = seasonal_mean.get(dow, df_idxed['y'].mean())
                 hist_effects.append(val - baseline)
@@ -227,7 +244,7 @@ def forecast_additive_simple(serie: pd.DataFrame, horizon: int, holidays: Option
     preds = [float(max(0, p)) for p in preds]
     return pd.DataFrame({'ds': future_idx, 'yhat': preds})
 
-# Ensemble simple (promedio de los cinco modelos)
+# Ensemble simple
 def forecast_ensemble_all(serie: pd.DataFrame, horizon: int, holidays: Optional[List[date]] = None):
     preds_list = []
     preds_list.append(forecast_naive_seasonal(serie, horizon)['yhat'].values)
@@ -347,6 +364,56 @@ def mostrar_pestana_reportes():
             fig_bar.update_layout(showlegend=False, yaxis={'categoryorder': 'array', 'categoryarray': ['UTILIDAD', 'GASTOS', 'INSUMOS', 'SOTUTA', 'BOKOBA', 'CONSOLIDADA'], 'title': None}, xaxis={'title': None, 'showticklabels': False})
             st.plotly_chart(fig_bar, use_container_width=True, key="barras_reportes")
 
+
+        # --- SECCIÓN: ANÁLISIS DE PRODUCTOS Y COMPORTAMIENTO ---
+        st.markdown("---")
+        st.markdown("<h3 style='text-align: center;'>ANÁLISIS DE PRODUCTOS Y COMPORTAMIENTO</h3>", unsafe_allow_html=True)
+        
+        tab1, tab2, tab3, tab4 = st.tabs(["🏆 Top Productos", "📂 Categorías", "⏰ Horarios de Venta", "🛒 Venta Cruzada"])
+
+        # TAB 1: Top Productos
+        with tab1:
+            if 'PRODUCTO' in df_v_filtrado.columns:
+                top_prods = df_v_filtrado.groupby('PRODUCTO')['TOTAL'].sum().nlargest(10).reset_index()
+                fig_prod = px.bar(top_prods, x='TOTAL', y='PRODUCTO', orientation='h', 
+                                  title='Top 10 Productos por Ingreso', color='TOTAL', color_continuous_scale='Purples')
+                fig_prod.update_layout(yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig_prod, use_container_width=True)
+            else:
+                st.info("La columna 'PRODUCTO' no está disponible en los datos.")
+
+        # TAB 2: Categorías
+        with tab2:
+            if 'CATEGORÍA' in df_v_filtrado.columns:
+                cat_sales = df_v_filtrado.groupby('CATEGORÍA')['TOTAL'].sum().reset_index()
+                fig_cat = px.pie(cat_sales, values='TOTAL', names='CATEGORÍA', hole=0.4, 
+                                 title='Distribución de Ventas por Categoría')
+                st.plotly_chart(fig_cat, use_container_width=True)
+            else:
+                st.info("La columna 'CATEGORÍA' no está disponible en los datos.")
+
+        # TAB 3: Horarios de Venta
+        with tab3:
+            df_horas = analizar_horarios(df_v_filtrado)
+            if not df_horas.empty:
+                fig_horas = px.bar(df_horas, x='HORA NÚMERO', y='TOTAL', 
+                                   title='Ingresos por Hora del Día',
+                                   labels={'HORA NÚMERO': 'Hora del día', 'TOTAL': 'Ventas ($)'})
+                fig_horas.update_xaxes(tickmode='linear', tick0=0, dtick=1)
+                st.plotly_chart(fig_horas, use_container_width=True)
+            else:
+                st.info("No se pudo extraer la información de 'HORA NÚMERO'.")
+
+        # TAB 4: Venta Cruzada (Market Basket)
+        with tab4:
+            df_cruzada = analizar_venta_cruzada(df_v_filtrado)
+            if not df_cruzada.empty:
+                st.write("**Los 10 pares de productos que más se compran juntos en el mismo Número de Venta:**")
+                st.dataframe(df_cruzada, use_container_width=True, hide_index=True)
+            else:
+                st.info("No se detectaron ventas cruzadas suficientes con las columnas 'NÚMERO DE VENTA' y 'PRODUCTO'.")
+
+
         # --- SECCIÓN YoY ---
         st.markdown("---")
         st.markdown(f"<h3 style='text-align: center;'>COMPARACIÓN INTERANUAL: {mes_sel} {anio_anterior} vs {mes_sel} {anio_sel}</h3>", unsafe_allow_html=True)
@@ -398,9 +465,9 @@ def mostrar_pestana_reportes():
             st.caption("No hay datos comparativos interanuales disponibles.")
 
         # -------------------------
-        # Bloque: Pronóstico con los 5 modelos principales (sin ARIMA/SARIMA)
+        # Bloque: Pronóstico con los 5 modelos principales 
         # -------------------------
-        st.sidebar.markdown("### 🔮 Pronóstico: 5 modelos principales (sin ARIMA/SARIMA)")
+        st.sidebar.markdown("### 🔮 Pronóstico: 5 modelos principales")
         horizon = st.sidebar.slider("Horizonte (días)", 7, 60, 14)
         modelo_sel = st.sidebar.selectbox("Modelo", options=[
             "Naive estacional (dow)",
@@ -410,7 +477,7 @@ def mostrar_pestana_reportes():
             "Aditivo simple (Prophet-like)",
             "Ensemble (promedio de los 5)"
         ], index=5)
-        # Opcional: permitir ingresar feriados (fechas separadas por comas) para el modelo aditivo
+        
         feriados_input = st.sidebar.text_input("Feriados (YYYY-MM-DD, separados por coma)", value="")
         feriados = []
         if feriados_input:
