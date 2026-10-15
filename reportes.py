@@ -89,11 +89,155 @@ def safe_unique_sorted(df: pd.DataFrame, col: str) -> List[str]:
     return sorted([str(v).strip() for v in vals])
 
 def clear_caches_reportes():
-    for fn in (cargar_datos_por_mes, obtener_ventas_historicas_resumidas):
+    for fn in (cargar_datos_por_mes, obtener_ventas_historicas_resumidas, preparar_serie_diaria_simple):
         try:
             fn.clear()
         except Exception:
             pass
+
+# -------------------------
+# Modelos ligeros usando pandas + numpy (sin dependencias externas)
+# Cinco modelos principales (sin ARIMA/SARIMA)
+# 1) Naive estacional (promedio por día de semana)
+# 2) Media móvil
+# 3) Suavizado exponencial simple (SES)
+# 4) Tendencia lineal (polyfit)
+# 5) Modelo aditivo simple tipo "Prophet-like" (tendencia + estacionalidad semanal + feriados opcionales)
+# -------------------------
+import numpy as np
+
+@st.cache_data(ttl=TTL_VENTAS_HIST)
+def preparar_serie_diaria_simple(df: pd.DataFrame, marca: Optional[str]=None, sucursal: Optional[str]=None) -> pd.DataFrame:
+    """Devuelve serie diaria agregada con columnas ds (datetime) y y (float)."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ds","y"])
+    d = df.copy()
+    d['FECHA'] = pd.to_datetime(d['FECHA'])
+    if marca and marca.upper() not in ("TODAS","TODOS","ALL"):
+        d = d[d['MARCA'].astype(str).str.strip().str.upper() == marca.strip().upper()]
+    if sucursal and sucursal.upper() not in ("TODAS","TODOS","ALL"):
+        d = d[d['SUCURSAL'].astype(str).str.strip().str.upper() == sucursal.strip().upper()]
+    s = d.groupby(d['FECHA'].dt.date)['TOTAL'].sum().reset_index()
+    s.columns = ['ds','y']
+    s['ds'] = pd.to_datetime(s['ds'])
+    idx = pd.date_range(s['ds'].min(), s['ds'].max(), freq='D')
+    s = s.set_index('ds').reindex(idx).fillna(0.0).rename_axis('ds').reset_index()
+    return s
+
+# Métricas
+def mae(y_true, y_pred): return float(np.mean(np.abs(y_true - y_pred)))
+def rmse(y_true, y_pred): return float(np.sqrt(np.mean((y_true - y_pred)**2)))
+def mape(y_true, y_pred):
+    denom = np.where(y_true==0, 1, y_true)
+    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100)
+
+# 1) Naive estacional por día de semana
+def forecast_naive_seasonal(serie: pd.DataFrame, horizon: int):
+    df = serie.copy().set_index('ds')
+    df['dow'] = df.index.dayofweek
+    seasonal_mean = df.groupby('dow')['y'].mean()
+    last_date = df.index.max()
+    future_idx = pd.date_range(last_date + pd.Timedelta(days=1), periods=horizon, freq='D')
+    preds = [float(seasonal_mean.get(d.dayofweek, df['y'].mean())) for d in future_idx]
+    return pd.DataFrame({'ds': future_idx, 'yhat': preds})
+
+# 2) Media móvil simple
+def forecast_moving_average(serie: pd.DataFrame, horizon: int, window: int = 7):
+    df = serie.copy().set_index('ds')
+    last_mean = df['y'].rolling(window).mean().iloc[-1]
+    last_mean = float(last_mean) if not np.isnan(last_mean) else float(df['y'].mean())
+    future_idx = pd.date_range(df.index.max() + pd.Timedelta(days=1), periods=horizon, freq='D')
+    preds = [last_mean] * horizon
+    return pd.DataFrame({'ds': future_idx, 'yhat': preds})
+
+# 3) Suavizado exponencial simple (SES)
+def forecast_exp_smoothing(serie: pd.DataFrame, horizon: int, alpha: Optional[float] = None):
+    y = serie['y'].values
+    if len(y) == 0:
+        return pd.DataFrame({'ds': [], 'yhat': []})
+    if alpha is None:
+        alpha = 0.3
+    s = y[0]
+    for val in y[1:]:
+        s = alpha * val + (1 - alpha) * s
+    preds = [float(s)] * horizon
+    future_idx = pd.date_range(serie['ds'].max() + pd.Timedelta(days=1), periods=horizon, freq='D')
+    return pd.DataFrame({'ds': future_idx, 'yhat': preds})
+
+# 4) Tendencia lineal (extrapolación con polyfit)
+def forecast_linear_trend(serie: pd.DataFrame, horizon: int):
+    df = serie.copy().reset_index(drop=True)
+    x = np.arange(len(df))
+    y = df['y'].values
+    if len(x) < 2:
+        return forecast_moving_average(serie, horizon, window=7)
+    slope, intercept = np.polyfit(x, y, 1)
+    future_x = np.arange(len(df), len(df) + horizon)
+    preds = intercept + slope * future_x
+    preds = [float(max(0, p)) for p in preds]
+    future_idx = pd.date_range(df['ds'].iloc[-1] + pd.Timedelta(days=1), periods=horizon, freq='D')
+    return pd.DataFrame({'ds': future_idx, 'yhat': preds})
+
+# 5) Modelo aditivo simple tipo "Prophet-like" (tendencia + estacionalidad semanal + feriados opcionales)
+def forecast_additive_simple(serie: pd.DataFrame, horizon: int, holidays: Optional[List[date]] = None, trend_degree: int = 1):
+    """
+    Modelo aditivo simple:
+    - Tendencia: polinomio de grado trend_degree (por defecto 1)
+    - Estacionalidad semanal: promedio por día de semana (dow)
+    - Feriados: efecto medio observado en feriados (si se proveen)
+    La predicción es: trend(t) + seasonal(dow) + holiday_effect (si aplica)
+    """
+    df = serie.copy().reset_index(drop=True)
+    df['t'] = np.arange(len(df))  # tiempo
+    # Tendencia (polyfit)
+    if len(df) < 2:
+        trend_vals = np.zeros(horizon)
+    else:
+        coef = np.polyfit(df['t'].values, df['y'].values, deg=trend_degree)
+        future_t = np.arange(len(df), len(df) + horizon)
+        trend_vals = np.polyval(coef, future_t)
+
+    # Estacionalidad semanal
+    df_idxed = serie.copy().set_index('ds')
+    df_idxed['dow'] = df_idxed.index.dayofweek
+    seasonal_mean = df_idxed.groupby('dow')['y'].mean().to_dict()
+    future_idx = pd.date_range(serie['ds'].max() + pd.Timedelta(days=1), periods=horizon, freq='D')
+    seasonal_vals = np.array([seasonal_mean.get(d.dayofweek, df_idxed['y'].mean()) for d in future_idx])
+
+    # Efecto feriados (si se proveen): calculamos promedio de desviación en feriados respecto a estacional+trend histórica
+    holiday_effect = np.zeros(horizon)
+    if holidays:
+        # construir mapa de fechas históricas a efectos
+        hist_effects = []
+        for h in holidays:
+            try:
+                h_dt = pd.to_datetime(h).date()
+            except Exception:
+                continue
+            if h_dt in df_idxed.index.date:
+                val = df_idxed.loc[df_idxed.index.date == h_dt, 'y'].sum()
+                # baseline: promedio del mismo dow
+                dow = pd.to_datetime(h_dt).dayofweek
+                baseline = seasonal_mean.get(dow, df_idxed['y'].mean())
+                hist_effects.append(val - baseline)
+        avg_holiday_effect = np.mean(hist_effects) if hist_effects else 0.0
+        holiday_effect = np.array([avg_holiday_effect if d.date() in [pd.to_datetime(h).date() for h in holidays] else 0.0 for d in future_idx])
+
+    preds = trend_vals + seasonal_vals + holiday_effect
+    preds = [float(max(0, p)) for p in preds]
+    return pd.DataFrame({'ds': future_idx, 'yhat': preds})
+
+# Ensemble simple (promedio de los cinco modelos)
+def forecast_ensemble_all(serie: pd.DataFrame, horizon: int, holidays: Optional[List[date]] = None):
+    preds_list = []
+    preds_list.append(forecast_naive_seasonal(serie, horizon)['yhat'].values)
+    preds_list.append(forecast_moving_average(serie, horizon)['yhat'].values)
+    preds_list.append(forecast_exp_smoothing(serie, horizon)['yhat'].values)
+    preds_list.append(forecast_linear_trend(serie, horizon)['yhat'].values)
+    preds_list.append(forecast_additive_simple(serie, horizon, holidays=holidays)['yhat'].values)
+    avg = np.mean(np.vstack(preds_list), axis=0)
+    future_idx = pd.date_range(serie['ds'].max() + pd.Timedelta(days=1), periods=horizon, freq='D')
+    return pd.DataFrame({'ds': future_idx, 'yhat': avg})
 
 # -------------------------
 # Vistas Streamlit
@@ -252,6 +396,90 @@ def mostrar_pestana_reportes():
                         st.plotly_chart(fig_dinamica, use_container_width=True, key=f"yoy_dinamico_{i}_{idx}")
         else:
             st.caption("No hay datos comparativos interanuales disponibles.")
+
+        # -------------------------
+        # Bloque: Pronóstico con los 5 modelos principales (sin ARIMA/SARIMA)
+        # -------------------------
+        st.sidebar.markdown("### 🔮 Pronóstico: 5 modelos principales (sin ARIMA/SARIMA)")
+        horizon = st.sidebar.slider("Horizonte (días)", 7, 60, 14)
+        modelo_sel = st.sidebar.selectbox("Modelo", options=[
+            "Naive estacional (dow)",
+            "Media móvil (rolling)",
+            "Suavizado exponencial (SES)",
+            "Tendencia lineal",
+            "Aditivo simple (Prophet-like)",
+            "Ensemble (promedio de los 5)"
+        ], index=5)
+        # Opcional: permitir ingresar feriados (fechas separadas por comas) para el modelo aditivo
+        feriados_input = st.sidebar.text_input("Feriados (YYYY-MM-DD, separados por coma)", value="")
+        feriados = []
+        if feriados_input:
+            for part in feriados_input.split(","):
+                p = part.strip()
+                if p:
+                    try:
+                        feriados.append(pd.to_datetime(p).date())
+                    except Exception:
+                        pass
+
+        btn_run = st.sidebar.button("Generar pronóstico (5 modelos)")
+
+        if btn_run:
+            with st.spinner("Generando pronóstico con los 5 modelos..."):
+                serie = preparar_serie_diaria_simple(df_ventas, marca=marca_sel if marca_sel!="Todas" else None, sucursal=suc_sel if suc_sel!="Todas" else None)
+                if serie.empty or len(serie) < 7:
+                    st.warning("No hay datos suficientes para pronosticar.")
+                else:
+                    if modelo_sel == "Naive estacional (dow)":
+                        fc = forecast_naive_seasonal(serie, horizon)
+                    elif modelo_sel == "Media móvil (rolling)":
+                        fc = forecast_moving_average(serie, horizon, window=7)
+                    elif modelo_sel == "Suavizado exponencial (SES)":
+                        fc = forecast_exp_smoothing(serie, horizon, alpha=0.25)
+                    elif modelo_sel == "Tendencia lineal":
+                        fc = forecast_linear_trend(serie, horizon)
+                    elif modelo_sel == "Aditivo simple (Prophet-like)":
+                        fc = forecast_additive_simple(serie, horizon, holidays=feriados, trend_degree=1)
+                    else:
+                        fc = forecast_ensemble_all(serie, horizon, holidays=feriados)
+
+                    # Visualización: histórico + pronóstico
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=serie['ds'], y=serie['y'], name='Histórico', line=dict(color='#3B75AF')))
+                    fig.add_trace(go.Scatter(x=fc['ds'], y=fc['yhat'], name='Pronóstico', line=dict(color='#7030A0', dash='dash')))
+                    # Banda heurística +/- 20%
+                    upper = fc['yhat'] * 1.2
+                    lower = fc['yhat'] * 0.8
+                    fig.add_trace(go.Scatter(x=fc['ds'], y=upper, line=dict(width=0), showlegend=False))
+                    fig.add_trace(go.Scatter(x=fc['ds'], y=lower, line=dict(width=0), fill='tonexty', fillcolor='rgba(112,48,160,0.1)', showlegend=False))
+                    fig.update_layout(height=420, margin=dict(t=20,b=20,l=10,r=10))
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # Backtest holdout simple
+                    if len(serie) > horizon * 2:
+                        train = serie.iloc[:-horizon].reset_index(drop=True)
+                        test = serie.iloc[-horizon:].reset_index(drop=True)
+                        if modelo_sel == "Naive estacional (dow)":
+                            fc_train = forecast_naive_seasonal(train, horizon)
+                        elif modelo_sel == "Media móvil (rolling)":
+                            fc_train = forecast_moving_average(train, horizon, window=7)
+                        elif modelo_sel == "Suavizado exponencial (SES)":
+                            fc_train = forecast_exp_smoothing(train, horizon, alpha=0.25)
+                        elif modelo_sel == "Tendencia lineal":
+                            fc_train = forecast_linear_trend(train, horizon)
+                        elif modelo_sel == "Aditivo simple (Prophet-like)":
+                            fc_train = forecast_additive_simple(train, horizon, holidays=feriados, trend_degree=1)
+                        else:
+                            fc_train = forecast_ensemble_all(train, horizon, holidays=feriados)
+                        y_true = test['y'].values
+                        y_pred = fc_train['yhat'].values
+                        st.write({"MAE": mae(y_true,y_pred), "RMSE": rmse(y_true,y_pred), "MAPE": mape(y_true,y_pred)})
+                    else:
+                        st.info("No hay suficiente historia para backtest robusto.")
+
+                    # Descargar pronóstico
+                    csv = fc.to_csv(index=False).encode('utf-8')
+                    st.download_button("Descargar pronóstico (CSV)", data=csv, file_name=f"pronostico_{modelo_sel.replace(' ','_')}_{horizon}d.csv", mime="text/csv")
 
     except Exception as e:
         logger.exception("Error de visualización en reportes")
